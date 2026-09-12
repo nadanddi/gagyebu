@@ -1,6 +1,12 @@
 const ALLOWED_NAVER_HOSTS = new Set(['pay.naver.com', 'orders.pay.naver.com']);
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message && message.type === 'getConfig') {
+    chrome.storage.local.get(['webAppUrl', 'syncToken']).then((config) => {
+      sendResponse({ok: true, configured: Boolean(config.webAppUrl && config.syncToken)});
+    }).catch((error) => sendResponse({ok: false, error: error.message}));
+    return true;
+  }
   if (message && message.type === 'fetchNaver') {
     fetchNaver(message.url).then((text) => sendResponse({ok: true, text}))
       .catch((error) => sendResponse({ok: false, error: error.message}));
