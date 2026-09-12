@@ -207,6 +207,7 @@ function commitImportBatch(payload) {
   if (all.length > 10000) throw new Error('한 번에 반영할 수 있는 거래는 10,000건 이하입니다.');
 
   const inMonth = all.filter((row) => row.date.slice(0, 7) === payload.targetMonth);
+  const autoTopUpMatches = reconcileTossCardTopUps_(inMonth);
   const skippedMonth = all.length - inMonth.length;
   const existing = readExistingTransactionKeys_(ss);
   const seen = new Set(existing);
@@ -253,7 +254,8 @@ function commitImportBatch(payload) {
     incoming: incoming.length,
     duplicate: duplicateCount,
     skippedMonth: skippedMonth,
-    targetMonth: payload.targetMonth
+    targetMonth: payload.targetMonth,
+    autoTopUpMatches: autoTopUpMatches
   };
 }
 
@@ -389,13 +391,14 @@ function normalizeTransaction_(raw, bank, file, ownerLabels) {
   const amount = Math.abs(raw.outgoing || raw.incoming);
   const ownerHit = ownerLabels.some((name) => description.indexOf(name) >= 0);
   const isTransferType = !/카드결제|체크카드/.test(type);
-  const internal = /카드잔액\s*자동충전/.test(description) || (ownerHit && isTransferType);
+  const internal = /카드잔액\s*자동충전|토스.*자동충전|자동충전.*토스/.test(description) || (ownerHit && isTransferType);
   const bucket = internal ? '내부이체' : direction === '출금' ? '지출' : '입금';
   const method = paymentMethod_(description, type);
   const category = category_(description, type, direction, bucket, method);
   const row = {
     id: '', date: raw.date, time: raw.time || '미제공', bank: bank,
     method: method, description: description, type: type,
+    institution: cleanText_(raw.institution),
     direction: direction, amount: amount, rawAmount: Number(raw.rawAmount) || 0,
     balance: raw.balance === '' ? '' : Number(raw.balance),
     bucket: bucket, category: category,
@@ -405,6 +408,41 @@ function normalizeTransaction_(raw, bank, file, ownerLabels) {
   };
   row.id = 'auto-' + sha256_(transactionKey_(row)).slice(0, 16);
   return row;
+}
+
+/**
+ * OK저축은행 출금과 토스뱅크의 카드잔액 자동충전 입금을 한 쌍으로 표시합니다.
+ * 두 거래는 출금/입금 시트에 남기되 지출 및 외부입금 합계에서는 제외합니다.
+ */
+function reconcileTossCardTopUps_(rows) {
+  const usedOkRows = new Set();
+  let matched = 0;
+  const okOutgoing = rows.filter((row) =>
+    row.bank === 'OK저축은행' && row.direction === '출금'
+  );
+  const tossTopUps = rows.filter((row) =>
+    row.bank === '토스뱅크' && row.direction === '입금' && /카드잔액\s*자동충전/.test(row.description)
+  );
+
+  tossTopUps.forEach((tossRow) => {
+    const okRow = okOutgoing.find((candidate) =>
+      !usedOkRows.has(candidate) &&
+      candidate.date === tossRow.date &&
+      Number(candidate.amount) === Number(tossRow.amount)
+    );
+    if (!okRow) return;
+    usedOkRows.add(okRow);
+    [okRow, tossRow].forEach((row) => {
+      row.bucket = '내부이체';
+      row.category = '내부이체';
+      row.method = '카드잔액 자동충전';
+      if (!/OK저축은행→토스뱅크 자동충전/.test(row.note || '')) {
+        row.note = cleanText_([row.note, 'OK저축은행→토스뱅크 자동충전 대응'].filter(Boolean).join(' / '));
+      }
+    });
+    matched += 1;
+  });
+  return matched;
 }
 
 function paymentMethod_(description, type) {

@@ -1,6 +1,7 @@
 (function () {
   if (document.getElementById('gagyebu-npay-sync')) return;
 
+  const MAX_HISTORY_PAGES = 100;
   const panel = document.createElement('div');
   panel.id = 'gagyebu-npay-sync';
   panel.innerHTML = '<input type="month" aria-label="동기화할 월"><button type="button">가계부 자동 동기화</button><span></span>';
@@ -21,34 +22,59 @@
     try {
       const targetMonth = monthInput.value;
       if (!/^20\d{2}-\d{2}$/.test(targetMonth)) throw new Error('동기화할 월을 선택하세요.');
-      setStatus('결제 목록 확인 중…');
-      const currentHtml = document.documentElement.outerHTML;
-      const hintedMaximum = NaverPayParser.maximumPage(currentHtml);
-      const maximum = hintedMaximum > 1 ? hintedMaximum : 20;
-      const links = new Set(NaverPayParser.detailLinks(currentHtml, location.href));
-      for (let page = 1; page <= maximum; page += 1) {
-        const pageUrl = new URL(location.href);
-        pageUrl.searchParams.set('page', String(page));
-        const html = page === currentPage() ? currentHtml : await fetchText(pageUrl.href);
-        const before = links.size;
-        NaverPayParser.detailLinks(html, pageUrl.href).forEach((url) => links.add(url));
-        if (hintedMaximum === 1 && page > 1 && links.size === before) break;
-      }
-      if (!links.size) throw new Error('상세 결제 링크를 찾지 못했습니다. 현장결제 탭인지 확인하세요.');
 
       const records = [];
-      let processed = 0;
-      for (const url of links) {
-        setStatus('상세내역 읽는 중 ' + (++processed) + '/' + links.size);
-        const html = await fetchText(url);
-        const record = NaverPayParser.parseDetail(html, url);
-        if (NaverPayParser.isComplete(record) && record.date.slice(0, 7) === targetMonth) records.push(record);
+      const seenLinks = new Set();
+      const seenPages = new Set();
+      let foundTarget = false;
+      let reachedEnd = false;
+
+      for (let page = 1; page <= MAX_HISTORY_PAGES; page += 1) {
+        setStatus('결제 목록 ' + page + '페이지 확인 중…');
+        const pageUrl = new URL(location.href);
+        pageUrl.searchParams.set('page', String(page));
+        const html = page === currentPage()
+          ? document.documentElement.outerHTML
+          : await fetchText(pageUrl.href);
+        const pageLinks = NaverPayParser.detailLinks(html, pageUrl.href);
+        const signature = pageLinks.join('|');
+
+        if (!pageLinks.length || seenPages.has(signature)) {
+          reachedEnd = true;
+          break;
+        }
+        seenPages.add(signature);
+
+        const pageRecords = [];
+        for (const url of pageLinks) {
+          if (seenLinks.has(url)) continue;
+          seenLinks.add(url);
+          setStatus('결제 목록 ' + page + '페이지 상세내역 확인 중 (' + (pageRecords.length + 1) + '/' + pageLinks.length + ')');
+          const detailHtml = await fetchText(url);
+          const record = NaverPayParser.parseDetail(detailHtml, url);
+          if (!NaverPayParser.isComplete(record)) continue;
+          pageRecords.push(record);
+          if (record.date.slice(0, 7) === targetMonth) {
+            records.push(record);
+            foundTarget = true;
+          }
+        }
+
+        if (NaverPayParser.scanDecision(pageRecords, targetMonth, foundTarget) === 'stop') {
+          reachedEnd = true;
+          break;
+        }
       }
+
+      if (!reachedEnd) throw new Error('100페이지까지 확인했지만 ' + targetMonth + '의 끝에 도달하지 못했습니다. 기간을 나눠 다시 시도하세요.');
+      if (!seenLinks.size) throw new Error('상세 결제 링크를 찾지 못했습니다. 전체 또는 현장결제 탭인지 확인하세요.');
       if (!records.length) throw new Error(targetMonth + '의 날짜·금액·사용처가 있는 결제내역을 찾지 못했습니다.');
+
+      records.sort((left, right) => (left.date + left.time).localeCompare(right.date + right.time));
       const config = await send({type: 'getConfig'});
       if (!config.configured) {
         downloadCsv(records, targetMonth);
-        setStatus('완료: ' + records.length + '건을 로컬 CSV로 저장했습니다.', 'ok');
+        setStatus('완료: 여러 페이지에서 찾은 ' + records.length + '건을 CSV로 저장했습니다.', 'ok');
         return;
       }
       setStatus('가계부와 맞추는 중…');

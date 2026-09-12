@@ -52,6 +52,21 @@ const external = context.normalizeTransaction_({
 }, '토스뱅크', fakeFile, ['본인이름']);
 assert.equal(external.bucket, '지출');
 
+const topUpRows = [
+  context.normalizeTransaction_({
+    date: '2026-08-12', time: '', description: '토뱅 본인이름', type: '계좌이체',
+    outgoing: 30000, incoming: 0, rawAmount: -30000, balance: 70000, sourceRow: 2
+  }, 'OK저축은행', fakeFile, []),
+  context.normalizeTransaction_({
+    date: '2026-08-12', time: '12:34:57', description: '카드잔액 자동충전', type: '입금',
+    outgoing: 0, incoming: 30000, rawAmount: 30000, balance: 30000, sourceRow: 3
+  }, '토스뱅크', fakeFile, [])
+];
+assert.equal(context.reconcileTossCardTopUps_(topUpRows), 1);
+assert.deepEqual(Array.from(topUpRows, (row) => row.bucket), ['내부이체', '내부이체']);
+assert.deepEqual(Array.from(topUpRows, (row) => row.method), ['카드잔액 자동충전', '카드잔액 자동충전']);
+assert.match(topUpRows[0].note, /OK저축은행→토스뱅크 자동충전 대응/);
+
 assert.equal(
   context.naverPayNote_('원본에 거래시간 없음', '예시매장', '간단 메모'),
   '원본에 거래시간 없음 [네이버페이 사용처: 예시매장 / 간단 메모]'

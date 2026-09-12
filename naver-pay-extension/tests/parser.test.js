@@ -34,4 +34,16 @@ assert.deepEqual(parser.parseDetail(detail, 'https://orders.pay.naver.com/instan
 });
 
 assert.equal(parser.isComplete(parser.parseDetail(detail, 'https://example.invalid')), true);
+assert.equal(parser.scanDecision([
+  {date: '2026-09-10'}, {date: '2026-09-01'}
+], '2026-08', false), 'continue');
+assert.equal(parser.scanDecision([
+  {date: '2026-08-31'}, {date: '2026-08-01'}
+], '2026-08', true), 'continue');
+assert.equal(parser.scanDecision([
+  {date: '2026-08-01'}, {date: '2026-07-31'}
+], '2026-08', true), 'stop');
+assert.equal(parser.scanDecision([
+  {date: '2026-07-31'}
+], '2026-08', false), 'stop');
 console.log('naver pay parser tests passed');

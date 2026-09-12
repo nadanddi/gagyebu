@@ -16,7 +16,9 @@
       .replace(/<br\s*\/?>/gi, '\n')
       .replace(/<\/(?:div|p|li|section|article|h\d|button|dd|dt)>/gi, '\n')
       .replace(/<[^>]+>/g, ' ');
-    return decodeHtml(stripped).split(/\r?\n/).map((line) => line.replace(/\s+/g, ' ').trim()).filter(Boolean);
+    return decodeHtml(stripped).split(/\r?\n/)
+      .map((line) => line.replace(/\s+/g, ' ').trim())
+      .filter(Boolean);
   }
 
   function detailLinks(html, baseUrl) {
@@ -32,7 +34,7 @@
         seen.add(url);
         result.push(url);
       } catch (_error) {
-        // Ignore malformed links injected by unrelated page widgets.
+        // 관련 없는 위젯에 들어 있는 잘못된 링크는 무시합니다.
       }
     }
     return result;
@@ -67,11 +69,13 @@
     const text = lines.join('\n');
     const dt = parseDateTime(text);
     const payment = text.match(/결제번호\s*([0-9A-Z-]+)/i);
-    const total = text.match(/결제금액[\s\S]{0,160}?총\s*([\d,]+)원/) || text.match(/총\s*([\d,]+)원/);
+    const total = text.match(/결제금액[\s\S]{0,160}?총\s*([\d,]+)\s*원/) || text.match(/총\s*([\d,]+)\s*원/);
     const productSection = lines.findIndex((line) => line === '결제상품');
     const completeSection = lines.findIndex((line) => line === '결제완료');
     const merchant = productSection >= 0 ? firstUseful(lines, productSection + 1) : '';
-    const item = completeSection >= 0 ? firstUseful(lines, completeSection + 1, /^(문의하기|영수증|포인트 뽑기|결제완료)$/) : '';
+    const item = completeSection >= 0
+      ? firstUseful(lines, completeSection + 1, /^(문의하기|영수증|포인트 뽑기|결제완료)$/)
+      : '';
     const amount = total ? Number(total[1].replace(/,/g, '')) : 0;
     return {
       paymentId: payment ? payment[1] : paymentIdFromUrl(url),
@@ -93,5 +97,15 @@
     return Boolean(record && record.date && record.amount > 0 && (record.merchant || record.item));
   }
 
-  return {htmlToLines, detailLinks, maximumPage, parseDateTime, parseDetail, isComplete};
+  function scanDecision(records, targetMonth, foundTarget) {
+    const months = (records || [])
+      .map((record) => String(record.date || '').slice(0, 7))
+      .filter((month) => /^20\d{2}-\d{2}$/.test(month));
+    if (!months.length) return 'continue';
+    if (foundTarget && months.some((month) => month < targetMonth)) return 'stop';
+    if (!foundTarget && months.every((month) => month < targetMonth)) return 'stop';
+    return 'continue';
+  }
+
+  return {htmlToLines, detailLinks, maximumPage, parseDateTime, parseDetail, isComplete, scanDecision};
 });
