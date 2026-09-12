@@ -1,0 +1,625 @@
+const LEDGER = Object.freeze({
+  outgoingSheet: '출금관리',
+  incomingSheet: '입금관리',
+  sourceSheet: '원본대조',
+  logSheet: '가져오기 기록',
+  uploadRoot: '가계부_거래내역_가져오기',
+  uploadFolder: '스프레드시트_업로드_원본',
+  maxFileBytes: 8 * 1024 * 1024,
+  maxBatchBytes: 25 * 1024 * 1024,
+  extensions: ['csv', 'xls', 'xlsx', 'pdf'],
+  expenseCategories: [
+    '식비', '카페·간식', '식료품·편의점', '교통비', '공과금',
+    '문화·여가', '의료·건강', '미용', '구독·디지털', '쇼핑·생활',
+    '지역상품권·온누리충전', '기타·확인필요', '내부이체'
+  ],
+  incomeCategories: [
+    '이자', '환급·캐시백', '급여', '용돈', '정산금', '기타입금',
+    '입금·확인필요', '내부이체'
+  ]
+});
+
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu('가계부')
+    .addItem('거래내역 여러 파일 업로드', 'showUploadDialog')
+    .addSeparator()
+    .addItem('자동화 초기 설정', 'setupLedgerUploader')
+    .addItem('가져오기 기록 보기', 'showImportLog')
+    .addToUi();
+}
+
+function showUploadDialog() {
+  setupLedgerUploader_();
+  const html = HtmlService.createHtmlOutputFromFile('Upload')
+    .setWidth(760)
+    .setHeight(680);
+  SpreadsheetApp.getUi().showModalDialog(html, '은행 거래내역 여러 파일 업로드');
+}
+
+function setupLedgerUploader() {
+  setupLedgerUploader_();
+  SpreadsheetApp.getUi().alert('업로드 기능을 사용할 준비가 되었습니다.');
+}
+
+function setupLedgerUploader_() {
+  const ss = SpreadsheetApp.getActive();
+  requireLedgerSheets_(ss);
+  ensureLogSheet_(ss);
+}
+
+function showImportLog() {
+  const ss = SpreadsheetApp.getActive();
+  const sheet = ensureLogSheet_(ss);
+  ss.setActiveSheet(sheet);
+}
+
+function getUploaderConfig() {
+  const ss = SpreadsheetApp.getActive();
+  const savedNames = PropertiesService.getUserProperties().getProperty('OWNER_LABELS') || '';
+  return {
+    spreadsheetName: ss.getName(),
+    targetMonth: monthFromTitle_(ss.getName()),
+    ownerLabels: savedNames,
+    extensions: LEDGER.extensions,
+    maxFileBytes: LEDGER.maxFileBytes,
+    maxBatchBytes: LEDGER.maxBatchBytes
+  };
+}
+
+/**
+ * Saves and analyzes one browser-selected file. The dialog calls this method
+ * sequentially for every file in the multi-select list.
+ */
+function analyzeUploadedFile(payload) {
+  validateUploadPayload_(payload);
+  const ownerLabels = parseOwnerLabels_(payload.ownerLabels);
+  if (!ownerLabels.length) throw new Error('본인 계좌이체를 구분할 이름을 한 개 이상 입력하세요.');
+
+  const bytes = Utilities.base64Decode(payload.base64);
+  if (bytes.length > LEDGER.maxFileBytes) {
+    throw new Error('파일 하나는 8MB 이하만 업로드할 수 있습니다.');
+  }
+
+  const mime = payload.mimeType || mimeFromExtension_(extension_(payload.name));
+  const blob = Utilities.newBlob(bytes, mime, safeFileName_(payload.name));
+  const originalFolder = getOrCreateChildFolder_(getOrCreateFolder_(LEDGER.uploadRoot), LEDGER.uploadFolder);
+  const original = originalFolder.createFile(blob);
+
+  try {
+    const raw = parseSavedFile_(original);
+    const transactions = raw.rows.map((row) => normalizeTransaction_(row, raw.bank, original, ownerLabels));
+    if (!transactions.length) throw new Error('거래 행을 찾지 못했습니다. 은행명과 파일 기간을 확인하세요.');
+
+    const periods = [...new Set(transactions.map((row) => row.date.slice(0, 7)))].sort();
+    return {
+      fileId: original.getId(),
+      fileName: original.getName(),
+      fileUrl: original.getUrl(),
+      bank: raw.bank,
+      periods: periods,
+      warnings: raw.warnings || [],
+      count: transactions.length,
+      outgoingCount: transactions.filter((row) => row.direction === '출금').length,
+      incomingCount: transactions.filter((row) => row.direction === '입금').length,
+      spend: sum_(transactions.filter((row) => row.bucket === '지출').map((row) => row.amount)),
+      incoming: sum_(transactions.filter((row) => row.bucket === '입금').map((row) => row.amount)),
+      transactions: transactions
+    };
+  } catch (error) {
+    appendImportLog_({
+      fileName: original.getName(), fileUrl: original.getUrl(), bank: '',
+      found: 0, added: 0, duplicate: 0, skipped: 0,
+      status: '분석실패', message: error.message
+    });
+    throw error;
+  }
+}
+
+/** Applies all analyzed files as one user-confirmed batch. */
+function commitImportBatch(payload) {
+  if (!payload || !Array.isArray(payload.files) || !payload.files.length) {
+    throw new Error('반영할 분석 결과가 없습니다.');
+  }
+  if (!/^\d{4}-\d{2}$/.test(payload.targetMonth || '')) {
+    throw new Error('대상 월을 YYYY-MM 형식으로 지정하세요.');
+  }
+
+  const ss = SpreadsheetApp.getActive();
+  requireLedgerSheets_(ss);
+  ensureLogSheet_(ss);
+  PropertiesService.getUserProperties().setProperty('OWNER_LABELS', String(payload.ownerLabels || ''));
+
+  const files = payload.files.map(validateAnalyzedFile_);
+  const all = files.flatMap((file) => file.transactions.map((tx) => validateTransaction_(tx, file.fileId)));
+  if (all.length > 10000) throw new Error('한 번에 반영할 수 있는 거래는 10,000건 이하입니다.');
+
+  const inMonth = all.filter((row) => row.date.slice(0, 7) === payload.targetMonth);
+  const skippedMonth = all.length - inMonth.length;
+  const existing = readExistingTransactionKeys_(ss);
+  const seen = new Set(existing);
+  const fresh = [];
+  let duplicateCount = 0;
+
+  inMonth.forEach((row) => {
+    const key = transactionKey_(row);
+    if (seen.has(key)) duplicateCount += 1;
+    else {
+      seen.add(key);
+      row.id = 'auto-' + sha256_(key).slice(0, 16);
+      fresh.push(row);
+    }
+  });
+
+  const outgoing = fresh.filter((row) => row.direction === '출금');
+  const incoming = fresh.filter((row) => row.direction === '입금');
+  appendLedgerRows_(ss.getSheetByName(LEDGER.outgoingSheet), outgoing, true);
+  appendLedgerRows_(ss.getSheetByName(LEDGER.incomingSheet), incoming, false);
+  appendSourceRows_(ss.getSheetByName(LEDGER.sourceSheet), fresh);
+  refreshSummaryFormulas_(ss);
+  expandNativeTablesBestEffort_(ss);
+
+  files.forEach((file) => {
+    const fileRows = inMonth.filter((row) => row.fileId === file.fileId);
+    const added = fresh.filter((row) => row.fileId === file.fileId).length;
+    appendImportLog_({
+      fileName: file.fileName, fileUrl: file.fileUrl, bank: file.bank,
+      found: file.transactions.length, added: added,
+      duplicate: fileRows.length - added,
+      skipped: file.transactions.length - fileRows.length,
+      status: '완료', message: file.warnings.join(' / ')
+    });
+  });
+
+  SpreadsheetApp.flush();
+  return {
+    added: fresh.length,
+    outgoing: outgoing.length,
+    incoming: incoming.length,
+    duplicate: duplicateCount,
+    skippedMonth: skippedMonth,
+    targetMonth: payload.targetMonth
+  };
+}
+
+function parseSavedFile_(file) {
+  const ext = extension_(file.getName());
+  if (ext === 'csv') return parseCsvFile_(file);
+  if (ext === 'xls' || ext === 'xlsx') return parseExcelFile_(file);
+  if (ext === 'pdf') return parsePdfFile_(file);
+  throw new Error('지원하지 않는 파일 형식입니다: ' + ext);
+}
+
+function parseCsvFile_(file) {
+  const blob = file.getBlob();
+  let text = blob.getDataAsString('UTF-8');
+  if ((text.match(/�/g) || []).length > 2) text = blob.getDataAsString('EUC-KR');
+  text = text.replace(/^\uFEFF/, '');
+  const firstLine = text.split(/\r?\n/, 1)[0] || '';
+  const delimiters = [',', '\t', ';'];
+  const delimiter = delimiters.sort((a, b) => firstLine.split(b).length - firstLine.split(a).length)[0];
+  return parseMatrix_(Utilities.parseCsv(text, delimiter), file.getName());
+}
+
+function parseExcelFile_(file) {
+  let tempId = '';
+  try {
+    const converted = Drive.Files.create(
+      {name: 'tmp_' + file.getName(), mimeType: MimeType.GOOGLE_SHEETS},
+      file.getBlob(),
+      {fields: 'id'}
+    );
+    tempId = converted.id;
+    const book = SpreadsheetApp.openById(tempId);
+    const candidates = book.getSheets().map((sheet) => parseMatrix_(sheet.getDataRange().getDisplayValues(), file.getName(), true));
+    const best = candidates.sort((a, b) => b.rows.length - a.rows.length)[0];
+    if (!best || !best.rows.length) throw new Error('엑셀에서 거래 표를 찾지 못했습니다.');
+    return best;
+  } finally {
+    if (tempId) DriveApp.getFileById(tempId).setTrashed(true);
+  }
+}
+
+function parsePdfFile_(file) {
+  let tempId = '';
+  try {
+    const converted = Drive.Files.create(
+      {name: 'tmp_' + file.getName(), mimeType: MimeType.GOOGLE_DOCS},
+      file.getBlob(),
+      {ocrLanguage: 'ko', fields: 'id'}
+    );
+    tempId = converted.id;
+    Utilities.sleep(800);
+    const text = DocumentApp.openById(tempId).getBody().getText();
+    return parseWooriPdfText_(text, file.getName());
+  } finally {
+    if (tempId) DriveApp.getFileById(tempId).setTrashed(true);
+  }
+}
+
+function parseMatrix_(matrix, fileName, allowEmpty) {
+  const headerIndex = matrix.findIndex((row) => {
+    const joined = row.map(normalizeHeader_).join('|');
+    return /적요|거래내용|가맹점/.test(joined) && /거래일시|거래일자|거래일/.test(joined) && /거래금액|출금액|지급금액/.test(joined);
+  });
+  if (headerIndex < 0) {
+    if (allowEmpty) return {bank: bankFrom_(fileName, ''), rows: [], warnings: []};
+    throw new Error('CSV/엑셀의 거래 헤더를 찾지 못했습니다.');
+  }
+
+  const headers = matrix[headerIndex].map(normalizeHeader_);
+  const index = (names) => headers.findIndex((header) => names.indexOf(header) >= 0);
+  const dateCol = index(['거래일시', '거래일자', '거래일', '일자', '날짜']);
+  const descCol = index(['적요', '거래내용', '내용', '가맹점', '사용처']);
+  const typeCol = index(['거래유형', '구분', '거래구분']);
+  const amountCol = index(['거래금액', '금액']);
+  const outCol = index(['출금액', '지급금액', '출금금액']);
+  const inCol = index(['입금액', '입금금액']);
+  const balanceCol = index(['거래후잔액', '잔액']);
+  const institutionCol = index(['거래기관', '기관']);
+
+  const bank = bankFrom_(fileName, matrix.slice(0, headerIndex + 2).flat().join(' '));
+  const rows = [];
+  matrix.slice(headerIndex + 1).forEach((row, offset) => {
+    const dt = parseDateTime_(row[dateCol]);
+    if (!dt) return;
+    const type = cell_(row, typeCol);
+    const desc = cell_(row, descCol);
+    if (!desc && !type) return;
+    let outgoing = parseAmount_(cell_(row, outCol));
+    let incoming = parseAmount_(cell_(row, inCol));
+    let rawAmount = 0;
+
+    if (amountCol >= 0) {
+      rawAmount = parseSignedAmount_(cell_(row, amountCol));
+      const typeIsIncoming = /입금|환불|취소|캐시백|이자/.test(type);
+      if (typeIsIncoming || rawAmount > 0) incoming = Math.abs(rawAmount);
+      else outgoing = Math.abs(rawAmount);
+    } else rawAmount = incoming - outgoing;
+
+    if (!outgoing && !incoming) return;
+    rows.push({
+      date: dt.date, time: dt.time, description: desc, type: type,
+      institution: cell_(row, institutionCol), outgoing: outgoing,
+      incoming: incoming, rawAmount: rawAmount,
+      balance: balanceCol >= 0 ? parseSignedAmount_(cell_(row, balanceCol)) : '',
+      sourceRow: headerIndex + offset + 2
+    });
+  });
+  return {bank: bank, rows: rows, warnings: []};
+}
+
+function parseWooriPdfText_(text, fileName) {
+  const bank = bankFrom_(fileName, text);
+  const pattern = /(20\d{2}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\s+(\S+)\s+(.*?)\s+([\d,]+|-)\s+([\d,]+|-)\s+([\d,]+)/g;
+  const rows = [];
+  let match;
+  while ((match = pattern.exec(text)) !== null) {
+    const outgoing = parseAmount_(match[5]);
+    const incoming = parseAmount_(match[6]);
+    rows.push({
+      date: match[1], time: match[2], type: match[3], description: match[4].trim(),
+      institution: '', outgoing: outgoing, incoming: incoming,
+      rawAmount: incoming - outgoing, balance: parseAmount_(match[7]), sourceRow: rows.length + 1
+    });
+  }
+  if (!rows.length) throw new Error('PDF에서 거래 표를 찾지 못했습니다. 스캔 품질이나 비밀번호를 확인하세요.');
+  return {bank: bank, rows: rows, warnings: ['PDF 변환 결과는 원본대조에서 확인하세요.']};
+}
+
+function normalizeTransaction_(raw, bank, file, ownerLabels) {
+  const description = cleanText_(raw.description);
+  const type = cleanText_(raw.type);
+  const direction = raw.outgoing ? '출금' : '입금';
+  const amount = Math.abs(raw.outgoing || raw.incoming);
+  const ownerHit = ownerLabels.some((name) => description.indexOf(name) >= 0);
+  const isTransferType = !/카드결제|체크카드/.test(type);
+  const internal = /카드잔액\s*자동충전/.test(description) || (ownerHit && isTransferType);
+  const bucket = internal ? '내부이체' : direction === '출금' ? '지출' : '입금';
+  const method = paymentMethod_(description, type);
+  const category = category_(description, type, direction, bucket, method);
+  const row = {
+    id: '', date: raw.date, time: raw.time || '미제공', bank: bank,
+    method: method, description: description, type: type,
+    direction: direction, amount: amount, rawAmount: Number(raw.rawAmount) || 0,
+    balance: raw.balance === '' ? '' : Number(raw.balance),
+    bucket: bucket, category: category,
+    note: raw.time ? '' : '원본에 거래시간 없음',
+    sourceRow: Number(raw.sourceRow) || 0,
+    fileId: file.getId(), fileName: file.getName(), fileUrl: file.getUrl()
+  };
+  row.id = 'auto-' + sha256_(transactionKey_(row)).slice(0, 16);
+  return row;
+}
+
+function paymentMethod_(description, type) {
+  const text = description + ' ' + type;
+  if (/체크카드|카드결제/.test(text)) return '체크카드';
+  if (/네이버/.test(text)) return '네이버페이';
+  if (/카카오페이/.test(text)) return '카카오페이';
+  if (/온누리|상품권/.test(text) && /충전|상품권/.test(text)) return '상품권 충전';
+  return '계좌이체';
+}
+
+function category_(description, type, direction, bucket, method) {
+  if (bucket === '내부이체') return '내부이체';
+  if (direction === '입금') {
+    if (/이자/.test(description + type)) return '이자';
+    if (/환불|취소|캐시백/.test(description + type)) return '환급·캐시백';
+    return '입금·확인필요';
+  }
+  if (method === '상품권 충전') return '지역상품권·온누리충전';
+  if (/전력|가스요금|수도|통신요금/.test(description)) return '공과금';
+  if (/PC|피시|노래방|영화|유람선/i.test(description)) return '문화·여가';
+  if (/의원|병원|약국/.test(description)) return '의료·건강';
+  if (/헤어|미용/.test(description)) return '미용';
+  if (/주유|교통|티머니|버스|택시|철도/.test(description)) return '교통비';
+  if (/커피|카페|스타벅스|빽다방|제과|베이커리/.test(description)) return '카페·간식';
+  if (/밥상|찌개|소바|어묵|타코야끼|식당|고기|분식|치킨|피자/.test(description)) return '식비';
+  if (/마트|편의점|지에스25|GS25|세븐일레븐|CU|자연드림/.test(description)) return '식료품·편의점';
+  if (/ANTHROPIC|NETFLIX|YOUTUBE|구독/i.test(description)) return '구독·디지털';
+  return '기타·확인필요';
+}
+
+function appendLedgerRows_(sheet, rows, outgoing) {
+  if (!rows.length) return;
+  const start = sheet.getLastRow() + 1;
+  const values = rows.map((row) => [
+    row.id, toSheetDate_(row.date), row.time, safeCellText_(row.bank),
+    safeCellText_(row.method), safeCellText_(row.description), row.amount,
+    row.bucket, row.category, '', '', safeCellText_(row.note)
+  ]);
+  sheet.getRange(start, 1, values.length, 12).setValues(values);
+  sheet.getRange(start, 10, values.length, 1).setFormulas(rows.map((_, i) => [
+    '=IF(H' + (start + i) + '="' + (outgoing ? '지출' : '입금') + '",G' + (start + i) + ',0)'
+  ]));
+  sheet.getRange(start, 11, values.length, 1).setFormulas(rows.map((_, i) => [
+    '=IF(OR(I' + (start + i) + '="기타·확인필요",I' + (start + i) + '="입금·확인필요"),"확인필요","분류완료")'
+  ]));
+  const list = outgoing ? LEDGER.expenseCategories : LEDGER.incomeCategories;
+  const validation = SpreadsheetApp.newDataValidation().requireValueInList(list, true).setAllowInvalid(false).build();
+  sheet.getRange(start, 9, values.length, 1).setDataValidation(validation);
+  sheet.getRange(start, 2, values.length, 1).setNumberFormat('yyyy-mm-dd');
+  sheet.getRange(start, 7, values.length, 1).setNumberFormat('#,##0');
+  sheet.getRange(start, 10, values.length, 1).setNumberFormat('#,##0');
+}
+
+function appendSourceRows_(sheet, rows) {
+  if (!rows.length) return;
+  const start = sheet.getLastRow() + 1;
+  const sourceNames = {toss: '토스', woori: '우리', npay: '우리 N페이', ok: 'OK'};
+  const values = rows.map((row) => [
+    row.id, toSheetDate_(row.date), safeCellText_(row.bank), safeCellText_(row.description),
+    safeCellText_(row.type), row.rawAmount, row.balance, row.sourceRow,
+    sourceNames[bankCode_(row.bank)] || '자동업로드', safeCellText_(row.note), row.fileUrl
+  ]);
+  sheet.getRange(start, 1, values.length, 11).setValues(values);
+  sheet.getRange(start, 2, values.length, 1).setNumberFormat('yyyy-mm-dd');
+  sheet.getRange(start, 6, values.length, 2).setNumberFormat('#,##0');
+}
+
+function refreshSummaryFormulas_(ss) {
+  const sheet = ss.getSheetByName('월간요약');
+  if (!sheet) return;
+  const outEnd = ss.getSheetByName(LEDGER.outgoingSheet).getLastRow();
+  const inEnd = ss.getSheetByName(LEDGER.incomingSheet).getLastRow();
+  sheet.getRange('B5:B9').setFormulas([
+    ["=SUM('출금관리'!J2:J" + outEnd + ')'],
+    ["=SUM('입금관리'!J2:J" + inEnd + ')'],
+    ["=SUM('출금관리'!G2:G" + outEnd + ')'],
+    ["=SUM('입금관리'!G2:G" + inEnd + ')'],
+    [`=COUNTIFS('출금관리'!I2:I${outEnd},"기타·확인필요",'출금관리'!H2:H${outEnd},"지출")`]
+  ]);
+  const categories = sheet.getRange('A12:A23').getDisplayValues().flat();
+  sheet.getRange('B12:B23').setFormulas(categories.map((_, i) => [
+    "=SUMIF('출금관리'!I$2:I$" + outEnd + ',A' + (i + 12) + ",'출금관리'!J$2:J$" + outEnd + ')'
+  ]));
+  for (let row = 5; row <= 35; row += 1) {
+    sheet.getRange(row, 5).setFormula("=SUMIF('출금관리'!B$2:B$" + outEnd + ',D' + row + ",'출금관리'!J$2:J$" + outEnd + ')');
+    sheet.getRange(row, 6).setFormula("=SUMIF('입금관리'!B$2:B$" + inEnd + ',D' + row + ",'입금관리'!J$2:J$" + inEnd + ')');
+  }
+}
+
+function readExistingTransactionKeys_(ss) {
+  const keys = [];
+  [[LEDGER.outgoingSheet, '출금'], [LEDGER.incomingSheet, '입금']].forEach(([name, direction]) => {
+    const sheet = ss.getSheetByName(name);
+    if (sheet.getLastRow() < 2) return;
+    sheet.getRange(2, 2, sheet.getLastRow() - 1, 6).getDisplayValues().forEach((row) => {
+      keys.push([normalizeDate_(row[0]), row[1] || '미제공', cleanText_(row[2]), cleanText_(row[4]), parseAmount_(row[5]), direction].join('|'));
+    });
+  });
+  return keys;
+}
+
+function transactionKey_(row) {
+  return [row.date, row.time || '미제공', cleanText_(row.bank), cleanText_(row.description), Number(row.amount), row.direction].join('|');
+}
+
+function ensureLogSheet_(ss) {
+  let sheet = ss.getSheetByName(LEDGER.logSheet);
+  if (!sheet) {
+    sheet = ss.insertSheet(LEDGER.logSheet);
+    sheet.getRange(1, 1, 1, 11).setValues([[
+      '처리시각', '파일명', '기록은행', '발견건수', '추가건수', '중복건수',
+      '다른월 제외', '상태', '메시지', '원본링크', '실행사용자'
+    ]]);
+    sheet.setFrozenRows(1);
+    sheet.getRange('A1:K1').setBackground('#eeeeee').setFontWeight('bold');
+  }
+  return sheet;
+}
+
+function appendImportLog_(entry) {
+  const sheet = ensureLogSheet_(SpreadsheetApp.getActive());
+  sheet.appendRow([
+    new Date(), safeCellText_(entry.fileName), safeCellText_(entry.bank), entry.found || 0,
+    entry.added || 0, entry.duplicate || 0, entry.skipped || 0,
+    safeCellText_(entry.status), safeCellText_(entry.message), entry.fileUrl || '',
+    Session.getActiveUser().getEmail() || '현재 사용자'
+  ]);
+  sheet.getRange(sheet.getLastRow(), 1).setNumberFormat('yyyy-mm-dd hh:mm:ss');
+}
+
+function expandNativeTablesBestEffort_(ss) {
+  try {
+    const meta = Sheets.Spreadsheets.get(ss.getId(), {fields: 'sheets(properties(sheetId,title),tables(tableId,range))'});
+    const requests = [];
+    (meta.sheets || []).forEach((item) => {
+      const title = item.properties.title;
+      if (title !== LEDGER.outgoingSheet && title !== LEDGER.incomingSheet) return;
+      const lastRow = ss.getSheetByName(title).getLastRow();
+      (item.tables || []).forEach((table) => {
+        const next = Object.assign({}, table.range, {endRowIndex: lastRow, endColumnIndex: 12});
+        requests.push({updateTable: {table: {tableId: table.tableId, range: next}, fields: 'range'}});
+      });
+    });
+    if (requests.length) Sheets.Spreadsheets.batchUpdate({requests: requests}, ss.getId());
+  } catch (error) {
+    console.warn('표 범위 확장 보류: ' + error.message);
+  }
+}
+
+function requireLedgerSheets_(ss) {
+  [LEDGER.outgoingSheet, LEDGER.incomingSheet, LEDGER.sourceSheet].forEach((name) => {
+    if (!ss.getSheetByName(name)) throw new Error('필수 시트가 없습니다: ' + name);
+  });
+}
+
+function validateUploadPayload_(payload) {
+  if (!payload || !payload.name || !payload.base64) throw new Error('업로드 데이터가 비어 있습니다.');
+  const ext = extension_(payload.name);
+  if (LEDGER.extensions.indexOf(ext) < 0) throw new Error('CSV, XLS, XLSX, PDF만 업로드할 수 있습니다.');
+}
+
+function validateAnalyzedFile_(file) {
+  if (!file || !file.fileId || !Array.isArray(file.transactions)) throw new Error('분석 결과가 손상되었습니다.');
+  const driveFile = DriveApp.getFileById(file.fileId);
+  return {
+    fileId: file.fileId, fileName: driveFile.getName(), fileUrl: driveFile.getUrl(),
+    bank: cleanText_(file.bank), warnings: Array.isArray(file.warnings) ? file.warnings.map(cleanText_) : [],
+    transactions: file.transactions
+  };
+}
+
+function validateTransaction_(row, fileId) {
+  if (!row || !/^20\d{2}-\d{2}-\d{2}$/.test(row.date || '')) throw new Error('거래 날짜 형식이 잘못되었습니다.');
+  if (row.direction !== '출금' && row.direction !== '입금') throw new Error('거래 방향이 잘못되었습니다.');
+  const amount = Number(row.amount);
+  if (!Number.isFinite(amount) || amount <= 0) throw new Error('거래 금액이 잘못되었습니다.');
+  row.fileId = fileId;
+  row.amount = amount;
+  return row;
+}
+
+function getOrCreateFolder_(name) {
+  const folders = DriveApp.getFoldersByName(name);
+  return folders.hasNext() ? folders.next() : DriveApp.createFolder(name);
+}
+
+function getOrCreateChildFolder_(parent, name) {
+  const folders = parent.getFoldersByName(name);
+  return folders.hasNext() ? folders.next() : parent.createFolder(name);
+}
+
+function bankFrom_(fileName, content) {
+  const name = String(fileName).toLowerCase();
+  const text = String(content).toLowerCase();
+  if (/우리/.test(name)) return /n페이|네이버|n_pay|npay/.test(name) ? '우리은행 N페이' : '우리은행 일반';
+  if (/ok저축|오케이저축/.test(name)) return 'OK저축은행';
+  if (/토스|toss/.test(name)) return '토스뱅크';
+  if (/ok저축|오케이저축|064-61/.test(text)) return 'OK저축은행';
+  if (/우리/.test(text)) return /n페이|네이버|n_pay|npay/.test(name + ' ' + text.slice(0, 1000)) ? '우리은행 N페이' : '우리은행 일반';
+  if (/토스뱅크|toss/.test(text)) return '토스뱅크';
+  return '은행 확인필요';
+}
+
+function bankCode_(bank) {
+  if (bank === '토스뱅크') return 'toss';
+  if (bank === 'OK저축은행') return 'ok';
+  if (bank === '우리은행 N페이') return 'npay';
+  if (bank === '우리은행 일반') return 'woori';
+  return 'upload';
+}
+
+function parseDateTime_(value) {
+  const text = cleanText_(value).replace(/\./g, '-').replace(/\//g, '-');
+  const match = text.match(/(20\d{2}-\d{1,2}-\d{1,2})(?:\s+(\d{1,2}:\d{2}(?::\d{2})?))?/);
+  if (!match) return null;
+  const date = match[1].split('-').map((part, i) => i ? part.padStart(2, '0') : part).join('-');
+  let time = match[2] || '';
+  if (time && time.split(':').length === 2) time += ':00';
+  return {date: date, time: time};
+}
+
+function normalizeDate_(value) {
+  const parsed = parseDateTime_(value);
+  return parsed ? parsed.date : cleanText_(value);
+}
+
+function normalizeHeader_(value) {
+  return cleanText_(value).replace(/[\s_·()\[\]\/]/g, '');
+}
+
+function parseAmount_(value) {
+  if (value === null || value === undefined || value === '' || value === '-') return 0;
+  const number = Number(String(value).replace(/[^0-9.-]/g, ''));
+  return Number.isFinite(number) ? Math.abs(number) : 0;
+}
+
+function parseSignedAmount_(value) {
+  if (value === null || value === undefined || value === '' || value === '-') return 0;
+  const number = Number(String(value).replace(/[^0-9.-]/g, ''));
+  return Number.isFinite(number) ? number : 0;
+}
+
+function parseOwnerLabels_(value) {
+  return String(value || '').split(/[,\n]/).map(cleanText_).filter((name) => name.length >= 2).slice(0, 10);
+}
+
+function extension_(name) {
+  const match = String(name).toLowerCase().match(/\.([a-z0-9]+)$/);
+  return match ? match[1] : '';
+}
+
+function mimeFromExtension_(ext) {
+  return {
+    csv: 'text/csv', xls: 'application/vnd.ms-excel',
+    xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    pdf: 'application/pdf'
+  }[ext] || 'application/octet-stream';
+}
+
+function monthFromTitle_(title) {
+  const match = String(title).match(/(20\d{2})년\s*(\d{1,2})월/);
+  return match ? match[1] + '-' + match[2].padStart(2, '0') : Utilities.formatDate(new Date(), 'Asia/Seoul', 'yyyy-MM');
+}
+
+function toSheetDate_(iso) {
+  return new Date(iso + 'T00:00:00+09:00');
+}
+
+function sha256_(text) {
+  return Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, text, Utilities.Charset.UTF_8)
+    .map((byte) => (byte + 256).toString(16).slice(-2)).join('');
+}
+
+function safeCellText_(value) {
+  const text = cleanText_(value).slice(0, 5000);
+  return /^[=+\-@]/.test(text) ? "'" + text : text;
+}
+
+function safeFileName_(value) {
+  return String(value).replace(/[\\/:*?"<>|]/g, '_').slice(0, 180);
+}
+
+function cleanText_(value) {
+  return String(value === null || value === undefined ? '' : value).replace(/\s+/g, ' ').trim();
+}
+
+function cell_(row, index) {
+  return index < 0 ? '' : row[index];
+}
+
+function sum_(numbers) {
+  return numbers.reduce((total, value) => total + Number(value || 0), 0);
+}

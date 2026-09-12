@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <base target="_top">
+  <style>
+    body { font: 14px Arial, sans-serif; color: #202124; margin: 0; padding: 24px; }
+    h1 { font-size: 20px; margin: 0 0 8px; }
+    .note { color: #5f6368; margin-bottom: 18px; }
+    label { display: block; font-weight: 700; margin: 14px 0 6px; }
+    input[type="text"], input[type="month"], input[type="file"] { box-sizing: border-box; width: 100%; padding: 10px; }
+    input[type="file"] { border: 2px dashed #bdc1c6; border-radius: 8px; background: #fafafa; }
+    button { border: 0; border-radius: 4px; padding: 10px 16px; cursor: pointer; }
+    button.primary { background: #1a73e8; color: white; }
+    button.secondary { background: #f1f3f4; margin-left: 8px; }
+    button:disabled { opacity: .5; cursor: default; }
+    #actions { margin-top: 18px; }
+    #status { margin-top: 16px; min-height: 24px; }
+    .error { color: #b3261e; }
+    .ok { color: #137333; }
+    .file { border-top: 1px solid #e0e0e0; padding: 9px 0; }
+    .file strong { display: inline-block; max-width: 430px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
+    .pill { background: #e8f0fe; border-radius: 10px; color: #174ea6; font-size: 12px; padding: 2px 8px; margin-left: 6px; }
+    .summary { margin-top: 14px; padding: 12px; background: #f8f9fa; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <h1>은행 거래내역 여러 파일 업로드</h1>
+  <div class="note">CSV·XLS·XLSX·PDF를 섞어서 선택할 수 있습니다. 각 파일은 순서대로 분석되고 전체 결과를 한 번에 반영합니다.</div>
+
+  <label for="ownerLabels">본인 계좌이체 식별 이름</label>
+  <input id="ownerLabels" type="text" placeholder="이름이나 표시명을 쉼표로 구분">
+
+  <label for="targetMonth">반영할 월</label>
+  <input id="targetMonth" type="month">
+
+  <label for="files">거래내역 파일</label>
+  <input id="files" type="file" multiple accept=".csv,.xls,.xlsx,.pdf,text/csv,application/pdf,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet">
+
+  <div id="actions">
+    <button id="analyze" class="primary" onclick="analyzeAll()">여러 파일 분석</button>
+    <button id="commit" class="primary" onclick="commitAll()" disabled>가계부에 반영</button>
+    <button class="secondary" onclick="google.script.host.close()">닫기</button>
+  </div>
+  <div id="status"></div>
+  <div id="results"></div>
+
+  <script>
+    let analyzed = [];
+    let config = null;
+
+    google.script.run.withSuccessHandler((value) => {
+      config = value;
+      document.getElementById('ownerLabels').value = value.ownerLabels || '';
+      document.getElementById('targetMonth').value = value.targetMonth;
+    }).withFailureHandler(showError).getUploaderConfig();
+
+    function serverAnalyze(payload) {
+      return new Promise((resolve, reject) => google.script.run
+        .withSuccessHandler(resolve)
+        .withFailureHandler((error) => reject(new Error(error.message || String(error))))
+        .analyzeUploadedFile(payload));
+    }
+
+    function serverCommit(payload) {
+      return new Promise((resolve, reject) => google.script.run
+        .withSuccessHandler(resolve)
+        .withFailureHandler((error) => reject(new Error(error.message || String(error))))
+        .commitImportBatch(payload));
+    }
+
+    async function analyzeAll() {
+      const files = [...document.getElementById('files').files];
+      const ownerLabels = document.getElementById('ownerLabels').value.trim();
+      if (!files.length) return showError({message: '파일을 한 개 이상 선택하세요.'});
+      if (!ownerLabels) return showError({message: '본인 이체를 구분할 이름을 입력하세요.'});
+
+      const total = files.reduce((sum, file) => sum + file.size, 0);
+      if (config && total > config.maxBatchBytes) return showError({message: '선택한 파일의 합계는 25MB 이하여야 합니다.'});
+      const unsupported = files.find((file) => !/\.(csv|xls|xlsx|pdf)$/i.test(file.name));
+      if (unsupported) return showError({message: '지원하지 않는 파일입니다: ' + unsupported.name});
+      const tooLarge = files.find((file) => config && file.size > config.maxFileBytes);
+      if (tooLarge) return showError({message: '8MB를 넘는 파일입니다: ' + tooLarge.name});
+
+      analyzed = [];
+      setBusy(true);
+      document.getElementById('results').innerHTML = '';
+      try {
+        for (let index = 0; index < files.length; index += 1) {
+          const file = files[index];
+          setStatus((index + 1) + '/' + files.length + ' 분석 중: ' + escapeHtml(file.name));
+          const base64 = await readBase64(file);
+          const result = await serverAnalyze({name: file.name, mimeType: file.type, base64, ownerLabels});
+          analyzed.push(result);
+          renderFile(result);
+        }
+        renderSummary();
+        setStatus('모든 파일 분석이 끝났습니다. 결과를 확인하고 반영하세요.', 'ok');
+        document.getElementById('commit').disabled = false;
+      } catch (error) {
+        showError(error);
+      } finally {
+        setBusy(false, true);
+      }
+    }
+
+    async function commitAll() {
+      if (!analyzed.length) return;
+      const targetMonth = document.getElementById('targetMonth').value;
+      const ownerLabels = document.getElementById('ownerLabels').value.trim();
+      if (!targetMonth) return showError({message: '반영할 월을 선택하세요.'});
+      setBusy(true);
+      setStatus('중복 거래를 확인하고 가계부에 반영하는 중입니다.');
+      try {
+        const result = await serverCommit({files: analyzed, targetMonth, ownerLabels});
+        document.getElementById('results').innerHTML += '<div class="summary ok">' +
+          '<strong>반영 완료</strong><br>신규 ' + result.added.toLocaleString() + '건 · 중복 제외 ' +
+          result.duplicate.toLocaleString() + '건 · 다른 월 제외 ' + result.skippedMonth.toLocaleString() + '건</div>';
+        setStatus('가계부 반영이 완료되었습니다.', 'ok');
+        document.getElementById('commit').disabled = true;
+      } catch (error) {
+        showError(error);
+      } finally {
+        setBusy(false, true);
+      }
+    }
+
+    function readBase64(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result).split(',')[1]);
+        reader.onerror = () => reject(new Error('파일을 읽지 못했습니다: ' + file.name));
+        reader.readAsDataURL(file);
+      });
+    }
+
+    function renderFile(result) {
+      const periods = result.periods.map(escapeHtml).join(', ');
+      const warnings = result.warnings.length ? '<br><span class="error">' + result.warnings.map(escapeHtml).join(' / ') + '</span>' : '';
+      document.getElementById('results').innerHTML += '<div class="file"><strong>' + escapeHtml(result.fileName) +
+        '</strong><span class="pill">' + escapeHtml(result.bank) + '</span><br>' +
+        result.count.toLocaleString() + '건 · 출금 ' + result.outgoingCount.toLocaleString() +
+        '건 · 입금 ' + result.incomingCount.toLocaleString() + '건 · 기간 ' + periods + warnings + '</div>';
+    }
+
+    function renderSummary() {
+      const count = analyzed.reduce((sum, file) => sum + file.count, 0);
+      const spend = analyzed.reduce((sum, file) => sum + file.spend, 0);
+      const incoming = analyzed.reduce((sum, file) => sum + file.incoming, 0);
+      document.getElementById('results').innerHTML += '<div class="summary"><strong>전체 미리보기</strong><br>' +
+        analyzed.length + '개 파일 · ' + count.toLocaleString() + '건 · 지출 ' + spend.toLocaleString() +
+        '원 · 외부입금 ' + incoming.toLocaleString() + '원</div>';
+    }
+
+    function setBusy(busy, keepCommit) {
+      document.getElementById('analyze').disabled = busy;
+      if (!keepCommit) document.getElementById('commit').disabled = busy || !analyzed.length;
+      document.getElementById('files').disabled = busy;
+    }
+
+    function setStatus(message, className) {
+      const element = document.getElementById('status');
+      element.className = className || '';
+      element.innerHTML = message;
+    }
+
+    function showError(error) {
+      setStatus(escapeHtml(error.message || String(error)), 'error');
+      setBusy(false, true);
+    }
+
+    function escapeHtml(value) {
+      const div = document.createElement('div');
+      div.textContent = String(value);
+      return div.innerHTML;
+    }
+  </script>
+</body>
+</html>

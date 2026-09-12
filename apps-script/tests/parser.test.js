@@ -1,0 +1,55 @@
+const assert = require('assert');
+const crypto = require('crypto');
+const fs = require('fs');
+const vm = require('vm');
+
+const context = {
+  console,
+  Utilities: {
+    DigestAlgorithm: {SHA_256: 'SHA_256'},
+    Charset: {UTF_8: 'UTF_8'},
+    computeDigest(_algorithm, text) {
+      return [...crypto.createHash('sha256').update(text, 'utf8').digest()].map((n) => n > 127 ? n - 256 : n);
+    },
+    formatDate() { return '2026-08'; }
+  }
+};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync('apps-script/Code.gs', 'utf8'), context);
+
+const toss = context.parseMatrix_([
+  ['', '토스뱅크 거래내역'],
+  ['', '거래 일시', '적요', '거래 유형', '거래 기관', '계좌번호', '거래 금액', '거래 후 잔액', '메모'],
+  ['', '2026.08.10 12:00:00', '예시식당', '체크카드결제', '', '', '-12,000', '3,000', '']
+], '토스뱅크_거래내역.xlsx');
+assert.equal(toss.bank, '토스뱅크');
+assert.equal(toss.rows.length, 1);
+assert.equal(toss.rows[0].outgoing, 12000);
+
+const ok = context.parseMatrix_([
+  ['거래내역조회'],
+  ['거래일자', '출금액', '입금액', '잔액', '적요'],
+  ['2026.08.11', '10,000', '0', '90,000 원', '토뱅 본인이름']
+], 'OK저축은행_8월.xls');
+assert.equal(ok.bank, 'OK저축은행');
+assert.equal(ok.rows[0].time, '');
+
+const pdf = context.parseWooriPdfText_(
+  '2026-08-12 09:21:04 펌뱅킹 네이버파이낸셜 3,320 - 306,200',
+  '우리은행_n페이_8월.pdf'
+);
+assert.equal(pdf.bank, '우리은행 N페이');
+assert.equal(pdf.rows[0].outgoing, 3320);
+
+const fakeFile = {getId: () => 'file', getName: () => 'sample.xlsx', getUrl: () => 'https://example.invalid'};
+const own = context.normalizeTransaction_(ok.rows[0], ok.bank, fakeFile, ['본인이름']);
+assert.equal(own.bucket, '내부이체');
+assert.equal(own.amount, 10000);
+
+const external = context.normalizeTransaction_({
+  date: '2026-08-11', time: '10:00:00', description: '다른사람', type: '계좌이체',
+  outgoing: 5000, incoming: 0, rawAmount: -5000, balance: 0, sourceRow: 1
+}, '토스뱅크', fakeFile, ['본인이름']);
+assert.equal(external.bucket, '지출');
+
+console.log('parser tests passed');

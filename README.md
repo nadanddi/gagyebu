@@ -16,6 +16,11 @@
 월간요약, 출금관리, 입금관리, 원본대조로 구성하며 분류 변경은 요약에 반영됩니다.
 구조와 가져오기 원칙은 `docs/LEDGER_SPEC.md`에 정리되어 있습니다.
 
+## 거래내역 여러 파일 업로드
+
+`apps-script/`에는 Google Sheets 안에서 CSV, XLS, XLSX, PDF 파일을 여러 개 선택해 분석하고 한 번에 반영하는 Apps Script가 있습니다.
+본인계좌 이체와 중복 거래를 제외하고, 원본 파일과 처리 결과를 Drive에 기록하도록 구성했습니다.
+
 GitHub 저장소: https://github.com/nadanddi/gagyebu
 
 이 저장소는 공개 상태입니다. 실제 거래내역, 계좌번호, 개인 Google Drive 링크와 생성 결과 파일은 업로드하지 않습니다.

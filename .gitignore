@@ -13,3 +13,4 @@ build/
 Thumbs.db
 data/private/
 outputs/
+.clasp.json
