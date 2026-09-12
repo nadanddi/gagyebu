@@ -40,6 +40,20 @@ function onOpen() {
     .addToUi();
 }
 
+function onEdit(event) {
+  if (!event || !event.range) return;
+  const sheet = event.range.getSheet();
+  const ss = event.source;
+  if (sheet.getName() === LEDGER.dashboardSheet && event.range.getA1Notation() === 'B2') {
+    ensureDashboard_(ss, cleanText_(event.value));
+    return;
+  }
+  if ([LEDGER.outgoingSheet, LEDGER.naverReviewSheet].indexOf(sheet.getName()) >= 0) {
+    const dashboard = ss.getSheetByName(LEDGER.dashboardSheet);
+    if (dashboard) refreshCalendarNotes_(ss, dashboard, selectedMonth_(ss));
+  }
+}
+
 function showUploadDialog() {
   setupLedgerUploader_();
   const html = HtmlService.createHtmlOutputFromFile('Upload')
@@ -585,9 +599,9 @@ function ensureDashboard_(ss, preferredMonth) {
     ? sheet.getRange('B2').getDisplayValue()
     : (preferredMonth || monthFromTitle_(ss.getName()));
 
-  sheet.getRange('A1:F50').clearFormat();
-  sheet.getRange('A1:F50').setFontFamily('Arial').setVerticalAlignment('middle');
-  sheet.getRange('A1:F1').breakApart().merge().setValue('월별 가계부 대시보드')
+  sheet.getRange('A1:G50').clearFormat();
+  sheet.getRange('A1:G50').setFontFamily('Arial').setVerticalAlignment('middle');
+  sheet.getRange('A1:G1').breakApart().merge().setValue('월별 가계부 대시보드')
     .setBackground('#174ea6').setFontColor('#ffffff').setFontSize(18).setFontWeight('bold');
   sheet.getRange('A2').setValue('기준 월').setFontWeight('bold');
   sheet.getRange('B2').setValue(current).setBackground('#e8f0fe').setFontWeight('bold');
@@ -616,19 +630,9 @@ function ensureDashboard_(ss, preferredMonth) {
     return [`=SUMIFS('출금관리'!$J:$J,'출금관리'!$I:$I,A${row},'출금관리'!$E:$E,"<>네이버페이",'출금관리'!$B:$B,">="&${start},'출금관리'!$B:$B,"<"&${end})+SUMIFS('네이버페이 확인대기'!$D:$D,'네이버페이 확인대기'!$G:$G,A${row},'네이버페이 확인대기'!$B:$B,">="&${start},'네이버페이 확인대기'!$B:$B,"<"&${end})+IF(A${row}="기타·확인필요",SUMIFS('네이버페이 확인대기'!$D:$D,'네이버페이 확인대기'!$G:$G,"",'네이버페이 확인대기'!$B:$B,">="&${start},'네이버페이 확인대기'!$B:$B,"<"&${end}),0)`];
   })).setNumberFormat('#,##0원');
 
-  sheet.getRange('D19:F19').setValues([['날짜', '지출', '입금']]).setBackground('#d2e3fc').setFontWeight('bold');
-  for (let index = 0; index < 31; index += 1) {
-    const row = index + 20;
-    sheet.getRange(row, 4).setFormula('=IF(ROW()-19<=DAY(EOMONTH(' + start + ',0)),' + start + '+ROW()-20,"")');
-    sheet.getRange(row, 5).setFormula(`=IF(D${row}="",,SUMIF('출금관리'!$B:$B,D${row},'출금관리'!$J:$J))`);
-    sheet.getRange(row, 6).setFormula(`=IF(D${row}="",,SUMIF('입금관리'!$B:$B,D${row},'입금관리'!$J:$J))`);
-  }
-  sheet.getRange('D20:D50').setNumberFormat('m/d');
-  sheet.getRange('E20:F50').setNumberFormat('#,##0');
+  buildExpenseCalendar_(ss, sheet, current);
   sheet.setFrozenRows(2);
-  sheet.setColumnWidth(1, 170);
-  sheet.setColumnWidth(2, 125);
-  sheet.setColumnWidths(4, 3, 95);
+  sheet.setColumnWidths(1, 7, 125);
 
   sheet.getCharts().forEach((chart) => sheet.removeChart(chart));
   const chart = sheet.newChart().asPieChart()
@@ -644,7 +648,110 @@ function ensureDashboard_(ss, preferredMonth) {
     .setOption('height', 330)
     .build();
   sheet.insertChart(chart);
+  refreshCalendarNotes_(ss, sheet, current);
   return sheet;
+}
+
+function buildExpenseCalendar_(ss, sheet, month) {
+  const year = Number(month.slice(0, 4));
+  const monthIndex = Number(month.slice(5, 7)) - 1;
+  const first = new Date(year, monthIndex, 1);
+  const firstMonday = new Date(year, monthIndex, 1 - ((first.getDay() + 6) % 7));
+  const weekdays = ['월', '화', '수', '목', '금', '토', '일'];
+
+  sheet.getRange('D19:G50').breakApart().clearContent().clearFormat().clearNote().clearDataValidations();
+  sheet.getRange('A25:G50').breakApart().clearContent().clearFormat().clearNote().clearDataValidations();
+  sheet.getRange('A25:G25').merge().setValue('일자별 지출 달력')
+    .setBackground('#174ea6').setFontColor('#ffffff').setFontSize(14).setFontWeight('bold')
+    .setHorizontalAlignment('center');
+  sheet.getRange('A26:G26').setValues([weekdays]).setFontWeight('bold')
+    .setHorizontalAlignment('center').setBackground('#e8f0fe');
+  sheet.getRange('F26').setFontColor('#1a73e8');
+  sheet.getRange('G26').setFontColor('#d93025');
+
+  for (let week = 0; week < 6; week += 1) {
+    const dateRow = 27 + week * 2;
+    const amountRow = dateRow + 1;
+    const dates = [];
+    const formulas = [];
+    for (let day = 0; day < 7; day += 1) {
+      const date = new Date(firstMonday.getFullYear(), firstMonday.getMonth(), firstMonday.getDate() + week * 7 + day);
+      const inMonth = date.getFullYear() === year && date.getMonth() === monthIndex;
+      dates.push(inMonth ? date : '');
+      const cell = columnLetter_(day + 1) + dateRow;
+      formulas.push(inMonth
+        ? `=IF(${cell}="",,SUMIF('출금관리'!$B:$B,${cell},'출금관리'!$J:$J))`
+        : '');
+    }
+    sheet.getRange(dateRow, 1, 1, 7).setValues([dates]).setNumberFormat('d')
+      .setFontSize(10).setFontWeight('bold').setHorizontalAlignment('left')
+      .setBackground('#f8fafd').setBorder(true, true, false, true, false, true, '#dadce0', SpreadsheetApp.BorderStyle.SOLID);
+    sheet.getRange(amountRow, 1, 1, 7).setFormulas([formulas]).setNumberFormat('#,##0"원"')
+      .setFontSize(14).setFontWeight('bold').setHorizontalAlignment('center')
+      .setBackground('#ffffff').setBorder(false, true, true, true, false, true, '#dadce0', SpreadsheetApp.BorderStyle.SOLID);
+    sheet.setRowHeight(dateRow, 24);
+    sheet.setRowHeight(amountRow, 42);
+    sheet.getRange(dateRow, 6, 2, 1).setBackground('#f3f8ff');
+    sheet.getRange(dateRow, 7, 2, 1).setBackground('#fff5f5');
+    sheet.getRange(dateRow, 6).setFontColor('#1a73e8');
+    sheet.getRange(dateRow, 7).setFontColor('#d93025');
+  }
+}
+
+function refreshCalendarNotes_(ss, dashboard, month) {
+  if (!/^20\d{2}-(0[1-9]|1[0-2])$/.test(month || '')) return;
+  const reviewById = new Map();
+  const review = ss.getSheetByName(LEDGER.naverReviewSheet);
+  if (review && review.getLastRow() >= 2) {
+    review.getRange(2, 1, review.getLastRow() - 1, 9).getDisplayValues().forEach((row) => {
+      reviewById.set(cleanText_(row[0]), {merchant: cleanText_(row[5]), category: cleanText_(row[6])});
+    });
+  }
+
+  const byDate = new Map();
+  const outgoing = ss.getSheetByName(LEDGER.outgoingSheet);
+  if (outgoing && outgoing.getLastRow() >= 2) {
+    outgoing.getRange(2, 1, outgoing.getLastRow() - 1, 12).getValues().forEach((row) => {
+      if (cleanText_(row[7]) !== '지출') return;
+      const date = row[1] instanceof Date ? Utilities.formatDate(row[1], 'Asia/Seoul', 'yyyy-MM-dd') : normalizeDate_(row[1]);
+      if (date.slice(0, 7) !== month) return;
+      const reviewValue = reviewById.get(cleanText_(row[0])) || {};
+      const time = cleanText_(row[2]) || '시간 미제공';
+      const merchant = reviewValue.merchant || cleanText_(row[5]) || '사용처 확인필요';
+      const category = reviewValue.category || cleanText_(row[8]) || '기타·확인필요';
+      const amount = Number(row[9]) || Number(row[6]) || 0;
+      if (!byDate.has(date)) byDate.set(date, []);
+      byDate.get(date).push({time: time, merchant: merchant, category: category, amount: amount});
+    });
+  }
+
+  for (let week = 0; week < 6; week += 1) {
+    const dateRow = 27 + week * 2;
+    const amountRow = dateRow + 1;
+    const dates = dashboard.getRange(dateRow, 1, 1, 7).getValues()[0];
+    const notes = dates.map((value) => {
+      if (!(value instanceof Date)) return '';
+      const key = Utilities.formatDate(value, 'Asia/Seoul', 'yyyy-MM-dd');
+      const items = (byDate.get(key) || []).sort((left, right) => left.time.localeCompare(right.time));
+      if (!items.length) return '지출 없음';
+      const total = sum_(items.map((item) => item.amount));
+      return ['총지출 ' + total.toLocaleString('ko-KR') + '원', '']
+        .concat(items.map((item) => item.time + ' · ' + item.merchant + ' · ' + item.amount.toLocaleString('ko-KR') + '원 · ' + item.category))
+        .join('\n');
+    });
+    dashboard.getRange(dateRow, 1, 1, 7).setNotes([notes]);
+    dashboard.getRange(amountRow, 1, 1, 7).setNotes([notes]);
+  }
+}
+
+function columnLetter_(column) {
+  let result = '';
+  while (column > 0) {
+    column -= 1;
+    result = String.fromCharCode(65 + column % 26) + result;
+    column = Math.floor(column / 26);
+  }
+  return result;
 }
 
 function selectedMonth_(ss) {
