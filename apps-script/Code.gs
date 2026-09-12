@@ -3,6 +3,9 @@ const LEDGER = Object.freeze({
   incomingSheet: '입금관리',
   sourceSheet: '원본대조',
   logSheet: '가져오기 기록',
+  dashboardSheet: '대시보드',
+  monthSheet: '월목록',
+  naverReviewSheet: '네이버페이 확인대기',
   uploadRoot: '가계부_거래내역_가져오기',
   uploadFolder: '스프레드시트_업로드_원본',
   maxFileBytes: 8 * 1024 * 1024,
@@ -22,6 +25,11 @@ const LEDGER = Object.freeze({
 function onOpen() {
   SpreadsheetApp.getUi().createMenu('가계부')
     .addItem('거래내역 여러 파일 업로드', 'showUploadDialog')
+    .addItem('새 월 등록', 'registerNewMonth')
+    .addSeparator()
+    .addItem('월별 대시보드 보기', 'showDashboard')
+    .addItem('네이버페이 확인대기 보기', 'showNaverPayReview')
+    .addItem('네이버페이 입력 반영', 'syncNaverPayReviews')
     .addSeparator()
     .addItem('자동화 초기 설정', 'setupLedgerUploader')
     .addItem('가져오기 기록 보기', 'showImportLog')
@@ -45,6 +53,9 @@ function setupLedgerUploader_() {
   const ss = SpreadsheetApp.getActive();
   requireLedgerSheets_(ss);
   ensureLogSheet_(ss);
+  ensureMonthRegistry_(ss);
+  refreshNaverPayReview_(ss);
+  ensureDashboard_(ss);
 }
 
 function showImportLog() {
@@ -53,12 +64,42 @@ function showImportLog() {
   ss.setActiveSheet(sheet);
 }
 
+function showDashboard() {
+  const ss = SpreadsheetApp.getActive();
+  ensureMonthRegistry_(ss);
+  const sheet = ensureDashboard_(ss);
+  ss.setActiveSheet(sheet);
+}
+
+function registerNewMonth() {
+  const ui = SpreadsheetApp.getUi();
+  const response = ui.prompt('새 월 등록', '등록할 월을 YYYY-MM 형식으로 입력하세요.', ui.ButtonSet.OK_CANCEL);
+  if (response.getSelectedButton() !== ui.Button.OK) return;
+  const month = cleanText_(response.getResponseText());
+  if (!/^20\d{2}-(0[1-9]|1[0-2])$/.test(month)) {
+    ui.alert('월은 YYYY-MM 형식으로 입력하세요.');
+    return;
+  }
+  const ss = SpreadsheetApp.getActive();
+  ensureMonthRegistry_(ss, month);
+  const dashboard = ensureDashboard_(ss, month);
+  dashboard.getRange('B2').setValue(month);
+  ss.setActiveSheet(dashboard);
+  ui.alert(month + ' 월이 등록되었습니다. 이제 거래내역 파일을 업로드할 수 있습니다.');
+}
+
+function showNaverPayReview() {
+  const ss = SpreadsheetApp.getActive();
+  const sheet = refreshNaverPayReview_(ss);
+  ss.setActiveSheet(sheet);
+}
+
 function getUploaderConfig() {
   const ss = SpreadsheetApp.getActive();
   const savedNames = PropertiesService.getUserProperties().getProperty('OWNER_LABELS') || '';
   return {
     spreadsheetName: ss.getName(),
-    targetMonth: monthFromTitle_(ss.getName()),
+    targetMonth: selectedMonth_(ss),
     ownerLabels: savedNames,
     extensions: LEDGER.extensions,
     maxFileBytes: LEDGER.maxFileBytes,
@@ -86,7 +127,11 @@ function analyzeUploadedFile(payload) {
   const original = originalFolder.createFile(blob);
 
   try {
-    const raw = parseSavedFile_(original);
+    if (payload.pdfEncrypted && !payload.pdfText) {
+      throw new Error('암호는 확인했지만 PDF에서 텍스트를 읽지 못했습니다. 스캔형 암호화 PDF는 현재 지원하지 않습니다.');
+    }
+    const raw = parseSavedFile_(original, payload.pdfText || '');
+    if (payload.pdfEncrypted) raw.warnings = (raw.warnings || []).concat('암호화 PDF 해제 완료(암호는 저장하지 않음)');
     const transactions = raw.rows.map((row) => normalizeTransaction_(row, raw.bank, original, ownerLabels));
     if (!transactions.length) throw new Error('거래 행을 찾지 못했습니다. 은행명과 파일 기간을 확인하세요.');
 
@@ -156,6 +201,9 @@ function commitImportBatch(payload) {
   appendLedgerRows_(ss.getSheetByName(LEDGER.incomingSheet), incoming, false);
   appendSourceRows_(ss.getSheetByName(LEDGER.sourceSheet), fresh);
   refreshSummaryFormulas_(ss);
+  ensureMonthRegistry_(ss, payload.targetMonth);
+  refreshNaverPayReview_(ss);
+  ensureDashboard_(ss, payload.targetMonth).getRange('B2').setValue(payload.targetMonth);
   expandNativeTablesBestEffort_(ss);
 
   files.forEach((file) => {
@@ -181,11 +229,11 @@ function commitImportBatch(payload) {
   };
 }
 
-function parseSavedFile_(file) {
+function parseSavedFile_(file, pdfText) {
   const ext = extension_(file.getName());
   if (ext === 'csv') return parseCsvFile_(file);
   if (ext === 'xls' || ext === 'xlsx') return parseExcelFile_(file);
-  if (ext === 'pdf') return parsePdfFile_(file);
+  if (ext === 'pdf') return pdfText ? parseWooriPdfText_(pdfText, file.getName()) : parsePdfFile_(file);
   throw new Error('지원하지 않는 파일 형식입니다: ' + ext);
 }
 
@@ -417,6 +465,209 @@ function refreshSummaryFormulas_(ss) {
     sheet.getRange(row, 5).setFormula("=SUMIF('출금관리'!B$2:B$" + outEnd + ',D' + row + ",'출금관리'!J$2:J$" + outEnd + ')');
     sheet.getRange(row, 6).setFormula("=SUMIF('입금관리'!B$2:B$" + inEnd + ',D' + row + ",'입금관리'!J$2:J$" + inEnd + ')');
   }
+}
+
+function ensureMonthRegistry_(ss, explicitMonth) {
+  let sheet = ss.getSheetByName(LEDGER.monthSheet);
+  if (!sheet) {
+    sheet = ss.insertSheet(LEDGER.monthSheet);
+    sheet.getRange('A1').setValue('등록월').setFontWeight('bold').setBackground('#e8f0fe');
+  }
+
+  const months = new Set();
+  if (explicitMonth) months.add(explicitMonth);
+  months.add(monthFromTitle_(ss.getName()));
+  [LEDGER.outgoingSheet, LEDGER.incomingSheet].forEach((name) => {
+    const ledgerSheet = ss.getSheetByName(name);
+    if (!ledgerSheet || ledgerSheet.getLastRow() < 2) return;
+    ledgerSheet.getRange(2, 2, ledgerSheet.getLastRow() - 1, 1).getValues().forEach((row) => {
+      const value = row[0];
+      const month = value instanceof Date
+        ? Utilities.formatDate(value, 'Asia/Seoul', 'yyyy-MM')
+        : normalizeDate_(value).slice(0, 7);
+      if (/^20\d{2}-(0[1-9]|1[0-2])$/.test(month)) months.add(month);
+    });
+  });
+  if (sheet.getLastRow() >= 2) {
+    sheet.getRange(2, 1, sheet.getLastRow() - 1, 1).getDisplayValues().flat().forEach((month) => {
+      if (/^20\d{2}-(0[1-9]|1[0-2])$/.test(month)) months.add(month);
+    });
+  }
+  const values = [...months].sort().map((month) => [month]);
+  sheet.getRange(2, 1, Math.max(sheet.getMaxRows() - 1, 1), 1).clearContent();
+  if (values.length) sheet.getRange(2, 1, values.length, 1).setValues(values);
+  sheet.setColumnWidth(1, 110);
+  if (!sheet.isSheetHidden()) sheet.hideSheet();
+  return sheet;
+}
+
+function ensureDashboard_(ss, preferredMonth) {
+  let sheet = ss.getSheetByName(LEDGER.dashboardSheet);
+  if (!sheet) sheet = ss.insertSheet(LEDGER.dashboardSheet, 0);
+  const monthSheet = ensureMonthRegistry_(ss, preferredMonth);
+  const current = /^20\d{2}-(0[1-9]|1[0-2])$/.test(sheet.getRange('B2').getDisplayValue())
+    ? sheet.getRange('B2').getDisplayValue()
+    : (preferredMonth || monthFromTitle_(ss.getName()));
+
+  sheet.getRange('A1:F50').clearFormat();
+  sheet.getRange('A1:F50').setFontFamily('Arial').setVerticalAlignment('middle');
+  sheet.getRange('A1:F1').breakApart().merge().setValue('월별 가계부 대시보드')
+    .setBackground('#174ea6').setFontColor('#ffffff').setFontSize(18).setFontWeight('bold');
+  sheet.getRange('A2').setValue('기준 월').setFontWeight('bold');
+  sheet.getRange('B2').setValue(current).setBackground('#e8f0fe').setFontWeight('bold');
+  const monthValidation = SpreadsheetApp.newDataValidation()
+    .requireValueInRange(monthSheet.getRange('A2:A'), true).setAllowInvalid(false).build();
+  sheet.getRange('B2').setDataValidation(monthValidation);
+
+  sheet.getRange('A4:B4').setValues([['월 요약', '금액/건수']]).setBackground('#d2e3fc').setFontWeight('bold');
+  sheet.getRange('A5:A8').setValues([['총지출'], ['총입금'], ['수지'], ['확인필요']]);
+  const start = 'DATE(VALUE(LEFT($B$2,4)),VALUE(RIGHT($B$2,2)),1)';
+  const end = 'EDATE(' + start + ',1)';
+  sheet.getRange('B5:B8').setFormulas([
+    ["=SUMIFS('출금관리'!$J:$J,'출금관리'!$B:$B,\">=\"&" + start + ",'출금관리'!$B:$B,\"<\"&" + end + ')'],
+    ["=SUMIFS('입금관리'!$J:$J,'입금관리'!$B:$B,\">=\"&" + start + ",'입금관리'!$B:$B,\"<\"&" + end + ')'],
+    ['=B6-B5'],
+    ["=COUNTIFS('출금관리'!$I:$I,\"기타·확인필요\",'출금관리'!$H:$H,\"지출\",'출금관리'!$E:$E,\"<>네이버페이\",'출금관리'!$B:$B,\">=\"&" + start + ",'출금관리'!$B:$B,\"<\"&" + end + ")+COUNTIFS('네이버페이 확인대기'!$I:$I,\"확인필요\",'네이버페이 확인대기'!$B:$B,\">=\"&" + start + ",'네이버페이 확인대기'!$B:$B,\"<\"&" + end + ')']
+  ]);
+  sheet.getRange('B5:B7').setNumberFormat('#,##0원');
+  sheet.getRange('B8').setNumberFormat('#,##0건');
+
+  const categories = LEDGER.expenseCategories.filter((value) => value !== '내부이체');
+  sheet.getRange('A11:B11').setValues([['소비 항목', '금액']]).setBackground('#d2e3fc').setFontWeight('bold');
+  sheet.getRange(12, 1, categories.length, 1).setValues(categories.map((value) => [value]));
+  sheet.getRange(12, 2, categories.length, 1).setFormulas(categories.map((_, index) => {
+    const row = index + 12;
+    return [`=SUMIFS('출금관리'!$J:$J,'출금관리'!$I:$I,A${row},'출금관리'!$E:$E,"<>네이버페이",'출금관리'!$B:$B,">="&${start},'출금관리'!$B:$B,"<"&${end})+SUMIFS('네이버페이 확인대기'!$D:$D,'네이버페이 확인대기'!$G:$G,A${row},'네이버페이 확인대기'!$B:$B,">="&${start},'네이버페이 확인대기'!$B:$B,"<"&${end})+IF(A${row}="기타·확인필요",SUMIFS('네이버페이 확인대기'!$D:$D,'네이버페이 확인대기'!$G:$G,"",'네이버페이 확인대기'!$B:$B,">="&${start},'네이버페이 확인대기'!$B:$B,"<"&${end}),0)`];
+  })).setNumberFormat('#,##0원');
+
+  sheet.getRange('D19:F19').setValues([['날짜', '지출', '입금']]).setBackground('#d2e3fc').setFontWeight('bold');
+  for (let index = 0; index < 31; index += 1) {
+    const row = index + 20;
+    sheet.getRange(row, 4).setFormula('=IF(ROW()-19<=DAY(EOMONTH(' + start + ',0)),' + start + '+ROW()-20,"")');
+    sheet.getRange(row, 5).setFormula(`=IF(D${row}="",,SUMIF('출금관리'!$B:$B,D${row},'출금관리'!$J:$J))`);
+    sheet.getRange(row, 6).setFormula(`=IF(D${row}="",,SUMIF('입금관리'!$B:$B,D${row},'입금관리'!$J:$J))`);
+  }
+  sheet.getRange('D20:D50').setNumberFormat('m/d');
+  sheet.getRange('E20:F50').setNumberFormat('#,##0');
+  sheet.setFrozenRows(2);
+  sheet.setColumnWidth(1, 170);
+  sheet.setColumnWidth(2, 125);
+  sheet.setColumnWidths(4, 3, 95);
+
+  sheet.getCharts().forEach((chart) => sheet.removeChart(chart));
+  const chart = sheet.newChart().asPieChart()
+    .addRange(sheet.getRange(11, 1, categories.length + 1, 2))
+    .setNumHeaders(1)
+    .setPosition(2, 4, 0, 0)
+    .setOption('title', '소비 항목 비율')
+    .setOption('legend', {position: 'right', textStyle: {fontSize: 11}})
+    .setOption('pieHole', 0.35)
+    .setOption('pieSliceText', 'percentage')
+    .setOption('backgroundColor', '#ffffff')
+    .setOption('width', 560)
+    .setOption('height', 330)
+    .build();
+  sheet.insertChart(chart);
+  return sheet;
+}
+
+function selectedMonth_(ss) {
+  const sheet = ss.getSheetByName(LEDGER.dashboardSheet);
+  const value = sheet ? sheet.getRange('B2').getDisplayValue() : '';
+  return /^20\d{2}-(0[1-9]|1[0-2])$/.test(value) ? value : monthFromTitle_(ss.getName());
+}
+
+function refreshNaverPayReview_(ss) {
+  let sheet = ss.getSheetByName(LEDGER.naverReviewSheet);
+  if (!sheet) sheet = ss.insertSheet(LEDGER.naverReviewSheet);
+  if (sheet.getLastRow() === 0) {
+    sheet.getRange(1, 1, 1, 9).setValues([[
+      '거래ID', '날짜', '시간', '금액', '은행 표시내용', '실제 사용처', '소비분류', '메모', '상태'
+    ]]);
+  }
+  sheet.setFrozenRows(1);
+  sheet.getRange('A1:I1').setBackground('#fce8b2').setFontWeight('bold');
+  sheet.setColumnWidth(1, 190);
+  sheet.setColumnWidth(2, 100);
+  sheet.setColumnWidth(3, 85);
+  sheet.setColumnWidth(4, 100);
+  sheet.setColumnWidth(5, 240);
+  sheet.setColumnWidth(6, 180);
+  sheet.setColumnWidth(7, 170);
+  sheet.setColumnWidth(8, 220);
+  sheet.setColumnWidth(9, 100);
+
+  const known = new Set();
+  if (sheet.getLastRow() >= 2) {
+    sheet.getRange(2, 1, sheet.getLastRow() - 1, 1).getDisplayValues().flat().forEach((id) => known.add(id));
+  }
+  const outgoing = ss.getSheetByName(LEDGER.outgoingSheet);
+  const pending = [];
+  if (outgoing.getLastRow() >= 2) {
+    outgoing.getRange(2, 1, outgoing.getLastRow() - 1, 12).getValues().forEach((row) => {
+      const id = cleanText_(row[0]);
+      const bank = cleanText_(row[3]);
+      const method = cleanText_(row[4]);
+      const description = cleanText_(row[5]);
+      const bucket = cleanText_(row[7]);
+      const isNaverPay = method === '네이버페이' || /네이버페이|네이버파이낸셜/.test(bank + ' ' + description);
+      if (!id || known.has(id) || bucket !== '지출' || !isNaverPay) return;
+      pending.push([id, row[1], row[2], row[6], description, '', '', '', '확인필요']);
+    });
+  }
+  if (pending.length) {
+    const startRow = sheet.getLastRow() + 1;
+    sheet.getRange(startRow, 1, pending.length, 9).setValues(pending);
+    sheet.getRange(startRow, 2, pending.length, 1).setNumberFormat('yyyy-mm-dd');
+    sheet.getRange(startRow, 4, pending.length, 1).setNumberFormat('#,##0원');
+    const validation = SpreadsheetApp.newDataValidation()
+      .requireValueInList(LEDGER.expenseCategories.filter((value) => value !== '내부이체'), true)
+      .setAllowInvalid(false).build();
+    sheet.getRange(startRow, 7, pending.length, 1).setDataValidation(validation);
+  }
+  if (sheet.getLastRow() >= 2) {
+    const count = sheet.getLastRow() - 1;
+    sheet.getRange(2, 9, count, 1).setFormulas(Array.from({length: count}, (_, index) => {
+      const row = index + 2;
+      return ['=IF(AND(F' + row + '<>"",G' + row + '<>"",G' + row + '<>"기타·확인필요"),"입력완료","확인필요")'];
+    }));
+  }
+  return sheet;
+}
+
+function syncNaverPayReviews() {
+  const ss = SpreadsheetApp.getActive();
+  const review = refreshNaverPayReview_(ss);
+  const outgoing = ss.getSheetByName(LEDGER.outgoingSheet);
+  if (review.getLastRow() < 2 || outgoing.getLastRow() < 2) {
+    SpreadsheetApp.getUi().alert('반영할 네이버페이 확인 내역이 없습니다.');
+    return;
+  }
+  const outgoingRows = outgoing.getRange(2, 1, outgoing.getLastRow() - 1, 12).getValues();
+  const rowById = new Map(outgoingRows.map((row, index) => [cleanText_(row[0]), index + 2]));
+  const rows = review.getRange(2, 1, review.getLastRow() - 1, 9).getValues();
+  let updated = 0;
+  rows.forEach((row) => {
+    const id = cleanText_(row[0]);
+    const merchant = cleanText_(row[5]);
+    const category = cleanText_(row[6]);
+    const memo = cleanText_(row[7]);
+    const targetRow = rowById.get(id);
+    if (!targetRow || !merchant || !category || category === '기타·확인필요') return;
+    outgoing.getRange(targetRow, 9).setValue(category);
+    const previous = cleanText_(outgoing.getRange(targetRow, 12).getValue());
+    outgoing.getRange(targetRow, 12).setValue(naverPayNote_(previous, merchant, memo));
+    updated += 1;
+  });
+  ensureDashboard_(ss);
+  SpreadsheetApp.flush();
+  SpreadsheetApp.getUi().alert('네이버페이 확인 내역 ' + updated + '건을 출금관리에 반영했습니다.');
+}
+
+function naverPayNote_(previous, merchant, memo) {
+  const cleaned = cleanText_(previous).replace(/(?:^|\s)\[네이버페이 사용처:[^\]]*\]/g, '').trim();
+  const detail = '[네이버페이 사용처: ' + merchant + (memo ? ' / ' + memo : '') + ']';
+  return cleanText_((cleaned ? cleaned + ' ' : '') + detail);
 }
 
 function readExistingTransactionKeys_(ss) {

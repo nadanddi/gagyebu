@@ -20,6 +20,7 @@
 
 `apps-script/`에는 Google Sheets 안에서 CSV, XLS, XLSX, PDF 파일을 여러 개 선택해 분석하고 한 번에 반영하는 Apps Script가 있습니다.
 본인계좌 이체와 중복 거래를 제외하고, 원본 파일과 처리 결과를 Drive에 기록하도록 구성했습니다.
+월 선택형 대시보드, 소비 항목 원그래프, 새 월 등록, 네이버페이 사용처 확인대기 흐름도 포함합니다. 암호화 PDF는 업로드 창에서 암호를 받아 브라우저 안에서 해제하며 암호를 저장하지 않습니다.
 
 GitHub 저장소: https://github.com/nadanddi/gagyebu
 

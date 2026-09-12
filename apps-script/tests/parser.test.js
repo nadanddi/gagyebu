@@ -52,4 +52,13 @@ const external = context.normalizeTransaction_({
 }, '토스뱅크', fakeFile, ['본인이름']);
 assert.equal(external.bucket, '지출');
 
+assert.equal(
+  context.naverPayNote_('원본에 거래시간 없음', '예시매장', '간단 메모'),
+  '원본에 거래시간 없음 [네이버페이 사용처: 예시매장 / 간단 메모]'
+);
+assert.equal(
+  context.naverPayNote_('[네이버페이 사용처: 이전매장]', '새매장', ''),
+  '[네이버페이 사용처: 새매장]'
+);
+
 console.log('parser tests passed');
