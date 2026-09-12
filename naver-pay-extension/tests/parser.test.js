@@ -9,7 +9,6 @@ const history = `
     <a href="/instantPay/detail/20260911NP1000000002">결제완료</a>
   </body></html>`;
 
-assert.equal(parser.maximumPage(history), 4);
 assert.deepEqual(parser.detailLinks(history, 'https://pay.naver.com/pc/history?page=2'), [
   'https://orders.pay.naver.com/instantPay/detail/20260911NP1000000001?backUrl=x',
   'https://pay.naver.com/instantPay/detail/20260911NP1000000002'

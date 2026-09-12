@@ -398,7 +398,6 @@ function normalizeTransaction_(raw, bank, file, ownerLabels) {
   const row = {
     id: '', date: raw.date, time: raw.time || '미제공', bank: bank,
     method: method, description: description, type: type,
-    institution: cleanText_(raw.institution),
     direction: direction, amount: amount, rawAmount: Number(raw.rawAmount) || 0,
     balance: raw.balance === '' ? '' : Number(raw.balance),
     bucket: bucket, category: category,
@@ -482,6 +481,7 @@ function appendLedgerRows_(sheet, rows, outgoing) {
     safeCellText_(row.method), safeCellText_(row.description), row.amount,
     row.bucket, row.category, '', '', safeCellText_(row.note)
   ]);
+  ensureSheetCapacity_(sheet, start + values.length - 1, 12);
   sheet.getRange(start, 1, values.length, 12).setValues(values);
   sheet.getRange(start, 10, values.length, 1).setFormulas(rows.map((_, i) => [
     '=IF(H' + (start + i) + '="' + (outgoing ? '지출' : '입금') + '",G' + (start + i) + ',0)'
@@ -506,9 +506,19 @@ function appendSourceRows_(sheet, rows) {
     safeCellText_(row.type), row.rawAmount, row.balance, row.sourceRow,
     sourceNames[bankCode_(row.bank)] || '자동업로드', safeCellText_(row.note), row.fileUrl
   ]);
+  ensureSheetCapacity_(sheet, start + values.length - 1, 11);
   sheet.getRange(start, 1, values.length, 11).setValues(values);
   sheet.getRange(start, 2, values.length, 1).setNumberFormat('yyyy-mm-dd');
   sheet.getRange(start, 6, values.length, 2).setNumberFormat('#,##0');
+}
+
+function ensureSheetCapacity_(sheet, requiredRows, requiredColumns) {
+  if (sheet.getMaxRows() < requiredRows) {
+    sheet.insertRowsAfter(sheet.getMaxRows(), requiredRows - sheet.getMaxRows());
+  }
+  if (sheet.getMaxColumns() < requiredColumns) {
+    sheet.insertColumnsAfter(sheet.getMaxColumns(), requiredColumns - sheet.getMaxColumns());
+  }
 }
 
 function refreshSummaryFormulas_(ss) {
@@ -683,6 +693,7 @@ function refreshNaverPayReview_(ss) {
   }
   if (pending.length) {
     const startRow = sheet.getLastRow() + 1;
+    ensureSheetCapacity_(sheet, startRow + pending.length - 1, 9);
     sheet.getRange(startRow, 1, pending.length, 9).setValues(pending);
     sheet.getRange(startRow, 2, pending.length, 1).setNumberFormat('yyyy-mm-dd');
     sheet.getRange(startRow, 4, pending.length, 1).setNumberFormat('#,##0원');
@@ -825,7 +836,9 @@ function importNaverPayDetails_(ss, records) {
   });
 
   if (unmatchedRows.length) {
-    log.getRange(log.getLastRow() + 1, 1, unmatchedRows.length, 8).setValues(unmatchedRows);
+    const startRow = log.getLastRow() + 1;
+    ensureSheetCapacity_(log, startRow + unmatchedRows.length - 1, 8);
+    log.getRange(startRow, 1, unmatchedRows.length, 8).setValues(unmatchedRows);
     log.getRange(log.getLastRow() - unmatchedRows.length + 1, 1, unmatchedRows.length, 1).setNumberFormat('yyyy-mm-dd hh:mm:ss');
     log.getRange(log.getLastRow() - unmatchedRows.length + 1, 2, unmatchedRows.length, 1).setNumberFormat('yyyy-mm-dd hh:mm:ss');
     log.getRange(log.getLastRow() - unmatchedRows.length + 1, 3, unmatchedRows.length, 1).setNumberFormat('#,##0원');

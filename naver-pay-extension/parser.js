@@ -40,11 +40,6 @@
     return result;
   }
 
-  function maximumPage(html) {
-    const pages = [...String(html || '').matchAll(/[?&]page=(\d+)/g)].map((match) => Number(match[1]));
-    return pages.length ? Math.max(...pages.filter(Number.isFinite), 1) : 1;
-  }
-
   function firstUseful(lines, start, excluded) {
     const blocked = excluded || /^(문의하기|결제완료|영수증|포인트 뽑기|결제상품)$/;
     for (let index = start; index < Math.min(lines.length, start + 12); index += 1) {
@@ -139,7 +134,7 @@
   }
 
   return {
-    htmlToLines, detailLinks, maximumPage, parseDateTime, parseDetail,
+    htmlToLines, detailLinks, parseDateTime, parseDetail,
     parseHistoryCard, paymentIdFromUrl, isComplete, scanDecision
   };
 });
