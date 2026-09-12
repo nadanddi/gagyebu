@@ -26,6 +26,7 @@
       const records = [];
       const seenLinks = new Set();
       const seenPages = new Set();
+      const seenRecords = new Set();
       let foundTarget = false;
       let reachedEnd = false;
 
@@ -37,28 +38,46 @@
           ? document.documentElement.outerHTML
           : await fetchText(pageUrl.href);
         const pageLinks = NaverPayParser.detailLinks(html, pageUrl.href);
-        const signature = pageLinks.join('|');
+        const listRecords = historyRecords(html, pageUrl.href, targetMonth.slice(0, 4));
+        const signature = pageLinks.concat(listRecords.map(recordKey)).join('|');
 
-        if (!pageLinks.length || seenPages.has(signature)) {
+        if ((!pageLinks.length && !listRecords.length) || seenPages.has(signature)) {
           reachedEnd = true;
           break;
         }
         seenPages.add(signature);
 
         const pageRecords = [];
+        const fallbackByPaymentId = new Map(listRecords
+          .filter((record) => record.paymentId)
+          .map((record) => [record.paymentId, record]));
         for (const url of pageLinks) {
           if (seenLinks.has(url)) continue;
           seenLinks.add(url);
           setStatus('결제 목록 ' + page + '페이지 상세내역 확인 중 (' + (pageRecords.length + 1) + '/' + pageLinks.length + ')');
           const detailHtml = await fetchText(url);
-          const record = NaverPayParser.parseDetail(detailHtml, url);
+          const detail = NaverPayParser.parseDetail(detailHtml, url);
+          const fallback = fallbackByPaymentId.get(detail.paymentId);
+          const record = mergeRecord(detail, fallback);
           if (!NaverPayParser.isComplete(record)) continue;
+          seenRecords.add(recordKey(record));
           pageRecords.push(record);
           if (record.date.slice(0, 7) === targetMonth) {
             records.push(record);
             foundTarget = true;
           }
         }
+
+        listRecords.forEach((record) => {
+          const key = recordKey(record);
+          if (seenRecords.has(key) || !NaverPayParser.isComplete(record)) return;
+          seenRecords.add(key);
+          pageRecords.push(record);
+          if (record.date.slice(0, 7) === targetMonth) {
+            records.push(record);
+            foundTarget = true;
+          }
+        });
 
         if (NaverPayParser.scanDecision(pageRecords, targetMonth, foundTarget) === 'stop') {
           reachedEnd = true;
@@ -67,7 +86,6 @@
       }
 
       if (!reachedEnd) throw new Error('100페이지까지 확인했지만 ' + targetMonth + '의 끝에 도달하지 못했습니다. 기간을 나눠 다시 시도하세요.');
-      if (!seenLinks.size) throw new Error('상세 결제 링크를 찾지 못했습니다. 전체 또는 현장결제 탭인지 확인하세요.');
       if (!records.length) throw new Error(targetMonth + '의 날짜·금액·사용처가 있는 결제내역을 찾지 못했습니다.');
 
       records.sort((left, right) => (left.date + left.time).localeCompare(right.date + right.time));
@@ -91,6 +109,51 @@
 
   function currentPage() {
     return Number(new URL(location.href).searchParams.get('page') || 1);
+  }
+
+  function historyRecords(html, baseUrl, targetYear) {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const statuses = Array.from(doc.querySelectorAll('body *'))
+      .filter((element) => element.textContent.replace(/\s+/g, ' ').trim() === '결제완료');
+    const result = [];
+    const keys = new Set();
+
+    statuses.forEach((statusElement) => {
+      let element = statusElement;
+      let best = null;
+      for (let depth = 0; depth < 9 && element && element.parentElement; depth += 1) {
+        element = element.parentElement;
+        const text = NaverPayParser.htmlToLines(element.innerHTML).join('\n');
+        if ((text.match(/결제완료/g) || []).length > 1) break;
+        const links = NaverPayParser.detailLinks(element.outerHTML, baseUrl);
+        const candidate = NaverPayParser.parseHistoryCard(text, targetYear, links[0] || '');
+        if (NaverPayParser.isComplete(candidate)) best = candidate;
+        if (best && best.detailUrl) break;
+      }
+      if (!best) return;
+      const key = recordKey(best);
+      if (keys.has(key)) return;
+      keys.add(key);
+      result.push(best);
+    });
+    return result;
+  }
+
+  function mergeRecord(detail, fallback) {
+    const base = fallback || {};
+    return {
+      paymentId: detail.paymentId || base.paymentId || '',
+      date: detail.date || base.date || '',
+      time: detail.time || base.time || '',
+      merchant: detail.merchant || base.merchant || '',
+      item: detail.item || base.item || '',
+      amount: detail.amount || base.amount || 0,
+      detailUrl: detail.detailUrl || base.detailUrl || ''
+    };
+  }
+
+  function recordKey(record) {
+    return record.paymentId || [record.date, record.time, record.amount, record.merchant || record.item].join('|');
   }
 
   async function fetchText(url) {

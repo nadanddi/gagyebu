@@ -97,6 +97,37 @@
     return Boolean(record && record.date && record.amount > 0 && (record.merchant || record.item));
   }
 
+  function parseHistoryCard(text, targetYear, detailUrl) {
+    const lines = String(text || '').split(/\r?\n/)
+      .map((line) => line.replace(/\s+/g, ' ').trim())
+      .filter(Boolean);
+    const joined = lines.join('\n');
+    const dateMatch = joined.match(/(?:20\d{2}[.\/-]\s*)?(\d{1,2})[.\/-]\s*(\d{1,2})[.]?\s+(\d{1,2}):(\d{2})\s*결제/);
+    const amountMatch = joined.match(/(?:^|\n)\s*([\d,]+)\s*원(?:\s|$)/);
+    const statusIndex = lines.findIndex((line) => line === '결제완료');
+    let title = '';
+    for (let index = statusIndex >= 0 ? statusIndex + 1 : 0; index < lines.length; index += 1) {
+      const line = lines[index];
+      if (/^[\d,]+\s*원/.test(line) || /\d{1,2}[.\/-]\s*\d{1,2}[.]?\s+\d{1,2}:\d{2}\s*결제/.test(line)) break;
+      if (/^(포인트 뽑기|문의하기|영수증|결제완료)$/.test(line) || /적립/.test(line)) continue;
+      title = line.replace(/\s*[>›〉]$/, '').trim();
+      if (title) break;
+    }
+    const date = dateMatch
+      ? String(targetYear) + '-' + dateMatch[1].padStart(2, '0') + '-' + dateMatch[2].padStart(2, '0')
+      : '';
+    const amount = amountMatch ? Number(amountMatch[1].replace(/,/g, '')) : 0;
+    return {
+      paymentId: paymentIdFromUrl(detailUrl),
+      date: date,
+      time: dateMatch ? dateMatch[3].padStart(2, '0') + ':' + dateMatch[4] + ':00' : '',
+      merchant: title,
+      item: title,
+      amount: Number.isFinite(amount) ? amount : 0,
+      detailUrl: String(detailUrl || '')
+    };
+  }
+
   function scanDecision(records, targetMonth, foundTarget) {
     const months = (records || [])
       .map((record) => String(record.date || '').slice(0, 7))
@@ -107,5 +138,8 @@
     return 'continue';
   }
 
-  return {htmlToLines, detailLinks, maximumPage, parseDateTime, parseDetail, isComplete, scanDecision};
+  return {
+    htmlToLines, detailLinks, maximumPage, parseDateTime, parseDetail,
+    parseHistoryCard, paymentIdFromUrl, isComplete, scanDecision
+  };
 });

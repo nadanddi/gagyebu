@@ -34,6 +34,21 @@ assert.deepEqual(parser.parseDetail(detail, 'https://orders.pay.naver.com/instan
 });
 
 assert.equal(parser.isComplete(parser.parseDetail(detail, 'https://example.invalid')), true);
+assert.deepEqual(parser.parseHistoryCard([
+  '결제완료',
+  '설빙전북대점 >',
+  '17,500원 | 8. 20. 19:53 결제',
+  '40원 적립 완료',
+  '포인트 뽑기'
+].join('\n'), '2026', 'https://orders.pay.naver.com/instantPay/detail/20260820NP1000000003'), {
+  paymentId: '20260820NP1000000003',
+  date: '2026-08-20',
+  time: '19:53:00',
+  merchant: '설빙전북대점',
+  item: '설빙전북대점',
+  amount: 17500,
+  detailUrl: 'https://orders.pay.naver.com/instantPay/detail/20260820NP1000000003'
+});
 assert.equal(parser.scanDecision([
   {date: '2026-09-10'}, {date: '2026-09-01'}
 ], '2026-08', false), 'continue');
