@@ -6,6 +6,9 @@ const LEDGER = Object.freeze({
   dashboardSheet: '대시보드',
   monthSheet: '월목록',
   naverReviewSheet: '네이버페이 확인대기',
+  naverSyncLogSheet: '네이버페이 동기화 기록',
+  spreadsheetIdProperty: 'LEDGER_SPREADSHEET_ID',
+  naverTokenProperty: 'NAVER_PAY_SYNC_TOKEN',
   uploadRoot: '가계부_거래내역_가져오기',
   uploadFolder: '스프레드시트_업로드_원본',
   maxFileBytes: 8 * 1024 * 1024,
@@ -30,6 +33,7 @@ function onOpen() {
     .addItem('월별 대시보드 보기', 'showDashboard')
     .addItem('네이버페이 확인대기 보기', 'showNaverPayReview')
     .addItem('네이버페이 입력 반영', 'syncNaverPayReviews')
+    .addItem('네이버페이 자동 동기화 설정', 'showNaverPaySyncSetup')
     .addSeparator()
     .addItem('자동화 초기 설정', 'setupLedgerUploader')
     .addItem('가져오기 기록 보기', 'showImportLog')
@@ -51,6 +55,7 @@ function setupLedgerUploader() {
 
 function setupLedgerUploader_() {
   const ss = SpreadsheetApp.getActive();
+  PropertiesService.getScriptProperties().setProperty(LEDGER.spreadsheetIdProperty, ss.getId());
   requireLedgerSheets_(ss);
   ensureLogSheet_(ss);
   ensureMonthRegistry_(ss);
@@ -92,6 +97,29 @@ function showNaverPayReview() {
   const ss = SpreadsheetApp.getActive();
   const sheet = refreshNaverPayReview_(ss);
   ss.setActiveSheet(sheet);
+}
+
+function showNaverPaySyncSetup() {
+  const ss = SpreadsheetApp.getActive();
+  PropertiesService.getScriptProperties().setProperty(LEDGER.spreadsheetIdProperty, ss.getId());
+  ensureNaverPaySyncToken_();
+  const html = HtmlService.createHtmlOutputFromFile('SyncSetup').setWidth(620).setHeight(520);
+  SpreadsheetApp.getUi().showModalDialog(html, '네이버페이 자동 동기화 설정');
+}
+
+function getNaverPaySyncSetup() {
+  const properties = PropertiesService.getScriptProperties();
+  return {
+    spreadsheetName: SpreadsheetApp.getActive().getName(),
+    token: ensureNaverPaySyncToken_(),
+    spreadsheetConfigured: Boolean(properties.getProperty(LEDGER.spreadsheetIdProperty))
+  };
+}
+
+function rotateNaverPaySyncToken() {
+  const token = createNaverPaySyncToken_();
+  PropertiesService.getScriptProperties().setProperty(LEDGER.naverTokenProperty, token);
+  return token;
 }
 
 function getUploaderConfig() {
@@ -668,6 +696,188 @@ function naverPayNote_(previous, merchant, memo) {
   const cleaned = cleanText_(previous).replace(/(?:^|\s)\[네이버페이 사용처:[^\]]*\]/g, '').trim();
   const detail = '[네이버페이 사용처: ' + merchant + (memo ? ' / ' + memo : '') + ']';
   return cleanText_((cleaned ? cleaned + ' ' : '') + detail);
+}
+
+function doPost(event) {
+  try {
+    const payload = JSON.parse(event && event.postData && event.postData.contents || '{}');
+    if (payload.action !== 'syncNaverPay') throw new Error('지원하지 않는 요청입니다.');
+    const expected = PropertiesService.getScriptProperties().getProperty(LEDGER.naverTokenProperty) || '';
+    if (!expected || !secureEquals_(String(payload.token || ''), expected)) throw new Error('동기화 토큰이 올바르지 않습니다.');
+    if (!Array.isArray(payload.records) || !payload.records.length) throw new Error('동기화할 결제내역이 없습니다.');
+    if (payload.records.length > 500) throw new Error('한 번에 500건까지만 동기화할 수 있습니다.');
+
+    const spreadsheetId = PropertiesService.getScriptProperties().getProperty(LEDGER.spreadsheetIdProperty);
+    if (!spreadsheetId) throw new Error('대상 가계부가 설정되지 않았습니다.');
+    const lock = LockService.getScriptLock();
+    lock.waitLock(20000);
+    try {
+      const result = importNaverPayDetails_(SpreadsheetApp.openById(spreadsheetId), payload.records);
+      return jsonOutput_(Object.assign({ok: true}, result));
+    } finally {
+      lock.releaseLock();
+    }
+  } catch (error) {
+    return jsonOutput_({ok: false, error: error.message || String(error)});
+  }
+}
+
+function importNaverPayDetails_(ss, records) {
+  requireLedgerSheets_(ss);
+  const review = refreshNaverPayReview_(ss);
+  const log = ensureNaverSyncLog_(ss);
+  const rowCount = Math.max(review.getLastRow() - 1, 0);
+  if (!rowCount) return {received: records.length, matched: 0, unmatched: records.length, duplicate: 0};
+
+  const reviewRows = review.getRange(2, 1, rowCount, 9).getValues();
+  const claimed = new Set();
+  const knownPaymentIds = new Set();
+  const logRowByPaymentId = new Map();
+  if (log.getLastRow() >= 2) {
+    log.getRange(2, 6, log.getLastRow() - 1, 1).getDisplayValues().flat().forEach((paymentId, index) => {
+      if (paymentId) logRowByPaymentId.set(paymentId, index + 2);
+    });
+  }
+  reviewRows.forEach((row) => {
+    const matches = cleanText_(row[7]).match(/결제번호:\s*([^\s|\]]+)/g) || [];
+    matches.forEach((value) => knownPaymentIds.add(value.replace(/^결제번호:\s*/, '')));
+  });
+
+  let matched = 0;
+  let unmatched = 0;
+  let duplicate = 0;
+  const unmatchedRows = [];
+  records.map(normalizeNaverPayDetail_).forEach((detail) => {
+    if (detail.paymentId && knownPaymentIds.has(detail.paymentId)) {
+      duplicate += 1;
+      return;
+    }
+    const candidates = [];
+    reviewRows.forEach((row, index) => {
+      if (claimed.has(index)) return;
+      const date = row[1] instanceof Date ? Utilities.formatDate(row[1], 'Asia/Seoul', 'yyyy-MM-dd') : normalizeDate_(row[1]);
+      if (date !== detail.date || Number(row[3]) !== detail.amount) return;
+      const score = timeDistance_(cleanText_(row[2]), detail.time);
+      candidates.push({index: index, score: score});
+    });
+    candidates.sort((a, b) => a.score - b.score);
+    if (!candidates.length) {
+      unmatched += 1;
+      if (!detail.paymentId || !logRowByPaymentId.has(detail.paymentId)) {
+        unmatchedRows.push(naverSyncLogRow_(detail, '은행 거래와 미일치'));
+      }
+      return;
+    }
+
+    const index = candidates[0].index;
+    claimed.add(index);
+    const row = reviewRows[index];
+    const merchant = detail.merchant || detail.item || '사용처 확인필요';
+    const description = cleanText_([detail.merchant, detail.item].filter(Boolean).join(' '));
+    const suggested = category_(description, '', '출금', '지출', '네이버페이');
+    row[5] = cleanText_(row[5]) || merchant;
+    if (!cleanText_(row[6]) && suggested !== '기타·확인필요') row[6] = suggested;
+    row[7] = naverSyncMemo_(row[7], detail);
+    review.getRange(index + 2, 6, 1, 3).setValues([[safeCellText_(row[5]), safeCellText_(row[6]), safeCellText_(row[7])]]);
+    if (detail.paymentId && logRowByPaymentId.has(detail.paymentId)) {
+      log.getRange(logRowByPaymentId.get(detail.paymentId), 7).setValue('추후 매칭완료');
+    }
+    if (detail.paymentId) knownPaymentIds.add(detail.paymentId);
+    matched += 1;
+  });
+
+  if (unmatchedRows.length) {
+    log.getRange(log.getLastRow() + 1, 1, unmatchedRows.length, 8).setValues(unmatchedRows);
+    log.getRange(log.getLastRow() - unmatchedRows.length + 1, 1, unmatchedRows.length, 1).setNumberFormat('yyyy-mm-dd hh:mm:ss');
+    log.getRange(log.getLastRow() - unmatchedRows.length + 1, 2, unmatchedRows.length, 1).setNumberFormat('yyyy-mm-dd hh:mm:ss');
+    log.getRange(log.getLastRow() - unmatchedRows.length + 1, 3, unmatchedRows.length, 1).setNumberFormat('#,##0원');
+  }
+  refreshNaverPayReview_(ss);
+  ensureDashboard_(ss);
+  SpreadsheetApp.flush();
+  return {received: records.length, matched: matched, unmatched: unmatched, duplicate: duplicate};
+}
+
+function normalizeNaverPayDetail_(record) {
+  const date = cleanText_(record && record.date);
+  const time = cleanText_(record && record.time) || '00:00:00';
+  const amount = Number(record && record.amount);
+  if (!/^20\d{2}-\d{2}-\d{2}$/.test(date)) throw new Error('네이버페이 결제 날짜 형식이 잘못되었습니다.');
+  if (!/^\d{2}:\d{2}:\d{2}$/.test(time)) throw new Error('네이버페이 결제 시간 형식이 잘못되었습니다.');
+  if (!Number.isFinite(amount) || amount <= 0) throw new Error('네이버페이 결제 금액이 잘못되었습니다.');
+  const detailUrl = cleanText_(record.detailUrl);
+  if (detailUrl && !/^https:\/\/(?:orders\.pay\.naver\.com|pay\.naver\.com)\//.test(detailUrl)) throw new Error('네이버페이 상세 주소가 올바르지 않습니다.');
+  return {
+    paymentId: cleanText_(record.paymentId).slice(0, 100), date: date, time: time, amount: amount,
+    merchant: cleanText_(record.merchant).slice(0, 300), item: cleanText_(record.item).slice(0, 500),
+    detailUrl: detailUrl.slice(0, 1000)
+  };
+}
+
+function naverSyncMemo_(previous, detail) {
+  const payment = detail.paymentId ? '결제번호: ' + detail.paymentId : '';
+  const item = detail.item ? '상품: ' + detail.item : '';
+  const parts = [payment, item, detail.detailUrl].filter(Boolean).join(' | ');
+  const marker = '[NPay 자동동기화 ' + parts + ']';
+  return cleanText_((cleanText_(previous) ? cleanText_(previous) + ' ' : '') + marker).slice(0, 5000);
+}
+
+function ensureNaverSyncLog_(ss) {
+  let sheet = ss.getSheetByName(LEDGER.naverSyncLogSheet);
+  if (!sheet) {
+    sheet = ss.insertSheet(LEDGER.naverSyncLogSheet);
+    sheet.getRange(1, 1, 1, 8).setValues([[
+      '처리시각', '결제일시', '금액', '사용처', '상품', '결제번호', '상태', '상세링크'
+    ]]).setBackground('#eeeeee').setFontWeight('bold');
+    sheet.setFrozenRows(1);
+    sheet.setColumnWidths(1, 3, 120);
+    sheet.setColumnWidths(4, 2, 220);
+    sheet.setColumnWidth(6, 180);
+    sheet.setColumnWidth(7, 140);
+    sheet.setColumnWidth(8, 260);
+  }
+  return sheet;
+}
+
+function naverSyncLogRow_(detail, status) {
+  return [
+    new Date(), new Date(detail.date + 'T' + detail.time + '+09:00'), detail.amount,
+    safeCellText_(detail.merchant), safeCellText_(detail.item), safeCellText_(detail.paymentId),
+    safeCellText_(status), detail.detailUrl
+  ];
+}
+
+function timeDistance_(left, right) {
+  const seconds = (value) => {
+    const match = cleanText_(value).match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+    return match ? Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3] || 0) : 0;
+  };
+  return Math.abs(seconds(left) - seconds(right));
+}
+
+function ensureNaverPaySyncToken_() {
+  const properties = PropertiesService.getScriptProperties();
+  let token = properties.getProperty(LEDGER.naverTokenProperty);
+  if (!token) {
+    token = createNaverPaySyncToken_();
+    properties.setProperty(LEDGER.naverTokenProperty, token);
+  }
+  return token;
+}
+
+function createNaverPaySyncToken_() {
+  return sha256_(Utilities.getUuid() + '|' + Utilities.getUuid() + '|' + new Date().getTime());
+}
+
+function secureEquals_(left, right) {
+  if (left.length !== right.length) return false;
+  let result = 0;
+  for (let index = 0; index < left.length; index += 1) result |= left.charCodeAt(index) ^ right.charCodeAt(index);
+  return result === 0;
+}
+
+function jsonOutput_(value) {
+  return ContentService.createTextOutput(JSON.stringify(value)).setMimeType(ContentService.MimeType.JSON);
 }
 
 function readExistingTransactionKeys_(ss) {

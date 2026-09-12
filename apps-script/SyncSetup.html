@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <base target="_top">
+  <style>
+    body { margin: 0; padding: 24px; color: #202124; font: 14px Arial, sans-serif; }
+    h1 { margin: 0 0 10px; font-size: 20px; }
+    ol { padding-left: 22px; line-height: 1.7; }
+    label { display: block; margin-top: 16px; font-weight: 700; }
+    .token { display: flex; gap: 8px; margin-top: 6px; }
+    input { box-sizing: border-box; flex: 1; min-width: 0; padding: 10px; border: 1px solid #bdc1c6; border-radius: 6px; }
+    button { border: 0; border-radius: 6px; padding: 10px 14px; cursor: pointer; }
+    .primary { background: #1a73e8; color: #fff; }
+    .secondary { background: #f1f3f4; }
+    .warning { margin-top: 16px; padding: 11px; border-radius: 6px; background: #fef7e0; }
+    #status { margin-top: 10px; color: #137333; }
+  </style>
+</head>
+<body>
+  <h1>네이버페이 자동 동기화 연결</h1>
+  <ol>
+    <li>Apps Script 편집기에서 <b>배포 → 새 배포 → 웹 앱</b>을 선택합니다.</li>
+    <li>실행 사용자는 본인, 액세스 사용자는 <b>모든 사용자</b>로 설정합니다. 웹 앱은 아래 임의 토큰이 맞는 요청만 처리합니다.</li>
+    <li>배포 후 받은 <code>/exec</code> 실행 URL과 아래 토큰을 Chrome 확장 프로그램 설정에 입력합니다.</li>
+    <li>네이버페이 결제내역 페이지에서 <b>가계부 자동 동기화</b>를 누릅니다.</li>
+  </ol>
+  <label for="token">동기화 토큰</label>
+  <div class="token">
+    <input id="token" type="password" readonly>
+    <button class="primary" onclick="copyToken()">복사</button>
+    <button class="secondary" onclick="rotateToken()">재발급</button>
+  </div>
+  <div class="warning">토큰은 비밀번호처럼 보관하세요. 재발급하면 기존 확장 프로그램 설정의 토큰은 더 이상 작동하지 않습니다.</div>
+  <div id="status">설정을 불러오는 중입니다.</div>
+
+  <script>
+    google.script.run.withSuccessHandler((value) => {
+      document.getElementById('token').value = value.token;
+      document.getElementById('status').textContent = value.spreadsheetName + ' 연결 준비가 되었습니다.';
+    }).withFailureHandler(showError).getNaverPaySyncSetup();
+
+    async function copyToken() {
+      const input = document.getElementById('token');
+      input.type = 'text';
+      input.select();
+      await navigator.clipboard.writeText(input.value);
+      input.type = 'password';
+      document.getElementById('status').textContent = '토큰을 복사했습니다.';
+    }
+
+    function rotateToken() {
+      if (!confirm('동기화 토큰을 재발급할까요? 기존 토큰은 즉시 사용할 수 없게 됩니다.')) return;
+      google.script.run.withSuccessHandler((token) => {
+        document.getElementById('token').value = token;
+        document.getElementById('status').textContent = '새 토큰을 발급했습니다.';
+      }).withFailureHandler(showError).rotateNaverPaySyncToken();
+    }
+
+    function showError(error) {
+      document.getElementById('status').textContent = error.message || String(error);
+    }
+  </script>
+</body>
+</html>

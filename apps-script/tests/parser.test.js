@@ -60,5 +60,27 @@ assert.equal(
   context.naverPayNote_('[네이버페이 사용처: 이전매장]', '새매장', ''),
   '[네이버페이 사용처: 새매장]'
 );
+assert.equal(context.timeDistance_('13:47:30', '13:47:38'), 8);
+assert.deepEqual(
+  JSON.parse(JSON.stringify(context.normalizeNaverPayDetail_({
+    paymentId: 'sample-payment', date: '2026-09-11', time: '13:47:38',
+    amount: 4500, merchant: '예시매장', item: '예시상품',
+    detailUrl: 'https://orders.pay.naver.com/instantPay/detail/sample-payment'
+  }))),
+  {
+    paymentId: 'sample-payment', date: '2026-09-11', time: '13:47:38', amount: 4500,
+    merchant: '예시매장', item: '예시상품',
+    detailUrl: 'https://orders.pay.naver.com/instantPay/detail/sample-payment'
+  }
+);
+assert.equal(context.secureEquals_('same-token', 'same-token'), true);
+assert.equal(context.secureEquals_('same-token', 'other-token'), false);
+assert.match(
+  context.naverSyncMemo_('', {
+    paymentId: 'sample-payment', item: '예시상품',
+    detailUrl: 'https://orders.pay.naver.com/instantPay/detail/sample-payment'
+  }),
+  /결제번호: sample-payment.*상품: 예시상품/
+);
 
 console.log('parser tests passed');
