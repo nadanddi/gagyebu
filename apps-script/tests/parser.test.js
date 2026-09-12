@@ -76,6 +76,15 @@ assert.equal(
   '[네이버페이 사용처: 새매장]'
 );
 assert.equal(context.timeDistance_('13:47:30', '13:47:38'), 8);
+assert.equal(context.naverMatchScore_('2026-08-20', 17500, '19:53:03', {
+  date: '2026-08-20', time: '19:53:00', amount: 17500
+}), 3);
+assert.equal(context.naverMatchScore_('2026-08-20', 16266, '19:53:03', {
+  date: '2026-08-20', time: '19:53:00', amount: 17500
+}), 86403);
+assert.equal(context.naverMatchScore_('2026-08-20', 16266, '20:00:00', {
+  date: '2026-08-20', time: '19:53:00', amount: 17500
+}), null);
 assert.deepEqual(
   JSON.parse(JSON.stringify(context.normalizeNaverPayDetail_({
     paymentId: 'sample-payment', date: '2026-09-11', time: '13:47:38',

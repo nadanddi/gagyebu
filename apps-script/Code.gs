@@ -716,8 +716,9 @@ function refreshCalendarNotes_(ss, dashboard, month) {
       const date = row[1] instanceof Date ? Utilities.formatDate(row[1], 'Asia/Seoul', 'yyyy-MM-dd') : normalizeDate_(row[1]);
       if (date.slice(0, 7) !== month) return;
       const reviewValue = reviewById.get(cleanText_(row[0])) || {};
+      const naverMarker = cleanText_(row[11]).match(/\[(?:네이버페이 사용처|네이버페이 결제):\s*([^\/\]]+)/);
       const time = cleanText_(row[2]) || '시간 미제공';
-      const merchant = reviewValue.merchant || cleanText_(row[5]) || '사용처 확인필요';
+      const merchant = reviewValue.merchant || (naverMarker ? cleanText_(naverMarker[1]) : '') || cleanText_(row[5]) || '사용처 확인필요';
       const category = reviewValue.category || cleanText_(row[8]) || '기타·확인필요';
       const amount = Number(row[9]) || Number(row[6]) || 0;
       if (!byDate.has(date)) byDate.set(date, []);
@@ -886,7 +887,11 @@ function importNaverPayDetails_(ss, records) {
   if (!rowCount) return {received: records.length, matched: 0, unmatched: records.length, duplicate: 0};
 
   const reviewRows = review.getRange(2, 1, rowCount, 9).getValues();
+  const outgoing = ss.getSheetByName(LEDGER.outgoingSheet);
+  const outgoingRows = outgoing.getRange(2, 1, outgoing.getLastRow() - 1, 12).getValues();
+  const reviewIds = new Set(reviewRows.map((row) => cleanText_(row[0])));
   const claimed = new Set();
+  const claimedOutgoing = new Set();
   const knownPaymentIds = new Set();
   const logRowByPaymentId = new Map();
   if (log.getLastRow() >= 2) {
@@ -896,6 +901,10 @@ function importNaverPayDetails_(ss, records) {
   }
   reviewRows.forEach((row) => {
     const matches = cleanText_(row[7]).match(/결제번호:\s*([^\s|\]]+)/g) || [];
+    matches.forEach((value) => knownPaymentIds.add(value.replace(/^결제번호:\s*/, '')));
+  });
+  outgoingRows.forEach((row) => {
+    const matches = cleanText_(row[11]).match(/결제번호:\s*([^\s|\]]+)/g) || [];
     matches.forEach((value) => knownPaymentIds.add(value.replace(/^결제번호:\s*/, '')));
   });
 
@@ -912,12 +921,36 @@ function importNaverPayDetails_(ss, records) {
     reviewRows.forEach((row, index) => {
       if (claimed.has(index)) return;
       const date = row[1] instanceof Date ? Utilities.formatDate(row[1], 'Asia/Seoul', 'yyyy-MM-dd') : normalizeDate_(row[1]);
-      if (date !== detail.date || Number(row[3]) !== detail.amount) return;
-      const score = timeDistance_(cleanText_(row[2]), detail.time);
+      const score = naverMatchScore_(date, row[3], row[2], detail);
+      if (score === null) return;
       candidates.push({index: index, score: score});
     });
     candidates.sort((a, b) => a.score - b.score);
     if (!candidates.length) {
+      const outgoingCandidates = [];
+      outgoingRows.forEach((row, index) => {
+        const id = cleanText_(row[0]);
+        if (!id || reviewIds.has(id) || claimedOutgoing.has(index) || cleanText_(row[7]) !== '지출') return;
+        const date = row[1] instanceof Date ? Utilities.formatDate(row[1], 'Asia/Seoul', 'yyyy-MM-dd') : normalizeDate_(row[1]);
+        const score = naverMatchScore_(date, row[6], row[2], detail);
+        if (score !== null) outgoingCandidates.push({index: index, score: score});
+      });
+      outgoingCandidates.sort((a, b) => a.score - b.score);
+      if (outgoingCandidates.length) {
+        const outgoingIndex = outgoingCandidates[0].index;
+        const outgoingRow = outgoingRows[outgoingIndex];
+        const description = cleanText_([detail.merchant, detail.item].filter(Boolean).join(' '));
+        const suggested = category_(description, '', '출금', '지출', '네이버페이');
+        if (cleanText_(outgoingRow[8]) === '기타·확인필요' && suggested !== '기타·확인필요') {
+          outgoing.getRange(outgoingIndex + 2, 9).setValue(suggested);
+          outgoingRow[8] = suggested;
+        }
+        outgoing.getRange(outgoingIndex + 2, 12).setValue(naverDirectNote_(outgoingRow[11], detail));
+        claimedOutgoing.add(outgoingIndex);
+        if (detail.paymentId) knownPaymentIds.add(detail.paymentId);
+        matched += 1;
+        return;
+      }
       unmatched += 1;
       if (!detail.paymentId || !logRowByPaymentId.has(detail.paymentId)) {
         unmatchedRows.push(naverSyncLogRow_(detail, '은행 거래와 미일치'));
@@ -975,9 +1008,27 @@ function normalizeNaverPayDetail_(record) {
 function naverSyncMemo_(previous, detail) {
   const payment = detail.paymentId ? '결제번호: ' + detail.paymentId : '';
   const item = detail.item ? '상품: ' + detail.item : '';
-  const parts = [payment, item, detail.detailUrl].filter(Boolean).join(' | ');
+  const shownAmount = detail.amount ? '네이버페이 표시금액: ' + Number(detail.amount).toLocaleString('ko-KR') + '원' : '';
+  const parts = [payment, item, shownAmount, detail.detailUrl].filter(Boolean).join(' | ');
   const marker = '[NPay 자동동기화 ' + parts + ']';
   return cleanText_((cleanText_(previous) ? cleanText_(previous) + ' ' : '') + marker).slice(0, 5000);
+}
+
+function naverDirectNote_(previous, detail) {
+  if (detail.paymentId && cleanText_(previous).indexOf('결제번호: ' + detail.paymentId) >= 0) return cleanText_(previous);
+  const merchant = detail.merchant || detail.item || '사용처 확인필요';
+  const item = detail.item ? '상품: ' + detail.item : '';
+  const payment = detail.paymentId ? '결제번호: ' + detail.paymentId : '';
+  const shownAmount = detail.amount ? '표시금액: ' + Number(detail.amount).toLocaleString('ko-KR') + '원' : '';
+  const marker = '[네이버페이 결제: ' + [merchant, payment, item, shownAmount, detail.detailUrl].filter(Boolean).join(' / ') + ']';
+  return cleanText_((cleanText_(previous) ? cleanText_(previous) + ' ' : '') + marker).slice(0, 5000);
+}
+
+function naverMatchScore_(date, amount, time, detail) {
+  if (normalizeDate_(date) !== detail.date) return null;
+  const distance = timeDistance_(cleanText_(time), detail.time);
+  if (Number(amount) === Number(detail.amount)) return distance;
+  return distance <= 90 ? 86400 + distance : null;
 }
 
 function ensureNaverSyncLog_(ss) {
