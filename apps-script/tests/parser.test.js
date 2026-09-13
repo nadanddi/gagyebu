@@ -67,13 +67,18 @@ assert.deepEqual(Array.from(topUpRows, (row) => row.bucket), ['내부이체', '�
 assert.deepEqual(Array.from(topUpRows, (row) => row.method), ['카드잔액 자동충전', '카드잔액 자동충전']);
 assert.match(topUpRows[0].note, /OK저축은행→토스뱅크 자동충전 대응/);
 
-assert.equal(
-  context.naverPayNote_('원본에 거래시간 없음', '예시매장', '간단 메모'),
-  '원본에 거래시간 없음 [네이버페이 사용처: 예시매장 / 간단 메모]'
+assert.match(
+  context.naverLedgerNote_('원본에 거래시간 없음', {
+    paymentId: 'sample-payment', amount: 4500, merchant: '예시매장', item: '예시상품',
+    detailUrl: 'https://orders.pay.naver.com/instantPay/detail/sample-payment'
+  }, '네이버파이낸셜'),
+  /원본에 거래시간 없음.*예시매장.*결제번호: sample-payment.*은행 표시내용: 네이버파이낸셜/
 );
 assert.equal(
-  context.naverPayNote_('[네이버페이 사용처: 이전매장]', '새매장', ''),
-  '[네이버페이 사용처: 새매장]'
+  context.naverLedgerNote_('[네이버페이 사용처: 이전매장]', {
+    paymentId: 'new-payment', amount: 1300, merchant: '새매장', item: '', detailUrl: ''
+  }, '네이버파이낸셜'),
+  '[네이버페이 결제: 새매장 / 결제번호: new-payment / 표시금액: 1,300원 / 은행 표시내용: 네이버파이낸셜]'
 );
 assert.equal(context.timeDistance_('13:47:30', '13:47:38'), 8);
 assert.equal(context.naverMatchScore_('2026-08-20', 17500, '19:53:03', {
@@ -85,6 +90,10 @@ assert.equal(context.naverMatchScore_('2026-08-20', 16266, '19:53:03', {
 assert.equal(context.naverMatchScore_('2026-08-20', 16266, '20:00:00', {
   date: '2026-08-20', time: '19:53:00', amount: 17500
 }), null);
+assert.equal(
+  context.naverDetailKey_('2026.08.20', '19:53:00', 17500, ' 예시매장 '),
+  '2026-08-20|19:53:00|17500|예시매장'
+);
 assert.deepEqual(
   JSON.parse(JSON.stringify(context.normalizeNaverPayDetail_({
     paymentId: 'sample-payment', date: '2026-09-11', time: '13:47:38',
@@ -99,12 +108,4 @@ assert.deepEqual(
 );
 assert.equal(context.secureEquals_('same-token', 'same-token'), true);
 assert.equal(context.secureEquals_('same-token', 'other-token'), false);
-assert.match(
-  context.naverSyncMemo_('', {
-    paymentId: 'sample-payment', item: '예시상품',
-    detailUrl: 'https://orders.pay.naver.com/instantPay/detail/sample-payment'
-  }),
-  /결제번호: sample-payment.*상품: 예시상품/
-);
-
 console.log('parser tests passed');

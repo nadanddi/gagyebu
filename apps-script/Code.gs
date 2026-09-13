@@ -5,7 +5,6 @@ const LEDGER = Object.freeze({
   logSheet: '가져오기 기록',
   dashboardSheet: '대시보드',
   monthSheet: '월목록',
-  naverReviewSheet: '네이버페이 확인대기',
   naverSyncLogSheet: '네이버페이 동기화 기록',
   spreadsheetIdProperty: 'LEDGER_SPREADSHEET_ID',
   naverTokenProperty: 'NAVER_PAY_SYNC_TOKEN',
@@ -31,8 +30,6 @@ function onOpen() {
     .addItem('새 월 등록', 'registerNewMonth')
     .addSeparator()
     .addItem('월별 대시보드 보기', 'showDashboard')
-    .addItem('네이버페이 확인대기 보기', 'showNaverPayReview')
-    .addItem('네이버페이 입력 반영', 'syncNaverPayReviews')
     .addItem('네이버페이 자동 동기화 설정', 'showNaverPaySyncSetup')
     .addSeparator()
     .addItem('자동화 초기 설정', 'setupLedgerUploader')
@@ -48,7 +45,7 @@ function onEdit(event) {
     ensureDashboard_(ss, cleanText_(event.value));
     return;
   }
-  if ([LEDGER.outgoingSheet, LEDGER.naverReviewSheet].indexOf(sheet.getName()) >= 0) {
+  if (sheet.getName() === LEDGER.outgoingSheet) {
     const dashboard = ss.getSheetByName(LEDGER.dashboardSheet);
     if (dashboard) refreshCalendarNotes_(ss, dashboard, selectedMonth_(ss));
   }
@@ -73,7 +70,6 @@ function setupLedgerUploader_() {
   requireLedgerSheets_(ss);
   ensureLogSheet_(ss);
   ensureMonthRegistry_(ss);
-  refreshNaverPayReview_(ss);
   ensureDashboard_(ss);
 }
 
@@ -105,12 +101,6 @@ function registerNewMonth() {
   dashboard.getRange('B2').setValue(month);
   ss.setActiveSheet(dashboard);
   ui.alert(month + ' 월이 등록되었습니다. 이제 거래내역 파일을 업로드할 수 있습니다.');
-}
-
-function showNaverPayReview() {
-  const ss = SpreadsheetApp.getActive();
-  const sheet = refreshNaverPayReview_(ss);
-  ss.setActiveSheet(sheet);
 }
 
 function showNaverPaySyncSetup() {
@@ -245,7 +235,6 @@ function commitImportBatch(payload) {
   appendSourceRows_(ss.getSheetByName(LEDGER.sourceSheet), fresh);
   refreshSummaryFormulas_(ss);
   ensureMonthRegistry_(ss, payload.targetMonth);
-  refreshNaverPayReview_(ss);
   ensureDashboard_(ss, payload.targetMonth).getRange('B2').setValue(payload.targetMonth);
   expandNativeTablesBestEffort_(ss);
 
@@ -617,7 +606,7 @@ function ensureDashboard_(ss, preferredMonth) {
     ["=SUMIFS('출금관리'!$J:$J,'출금관리'!$B:$B,\">=\"&" + start + ",'출금관리'!$B:$B,\"<\"&" + end + ')'],
     ["=SUMIFS('입금관리'!$J:$J,'입금관리'!$B:$B,\">=\"&" + start + ",'입금관리'!$B:$B,\"<\"&" + end + ')'],
     ['=B6-B5'],
-    ["=COUNTIFS('출금관리'!$I:$I,\"기타·확인필요\",'출금관리'!$H:$H,\"지출\",'출금관리'!$E:$E,\"<>네이버페이\",'출금관리'!$B:$B,\">=\"&" + start + ",'출금관리'!$B:$B,\"<\"&" + end + ")+COUNTIFS('네이버페이 확인대기'!$I:$I,\"확인필요\",'네이버페이 확인대기'!$B:$B,\">=\"&" + start + ",'네이버페이 확인대기'!$B:$B,\"<\"&" + end + ')']
+    ["=COUNTIFS('출금관리'!$I:$I,\"기타·확인필요\",'출금관리'!$H:$H,\"지출\",'출금관리'!$B:$B,\">=\"&" + start + ",'출금관리'!$B:$B,\"<\"&" + end + ')']
   ]);
   sheet.getRange('B5:B7').setNumberFormat('#,##0원');
   sheet.getRange('B8').setNumberFormat('#,##0건');
@@ -627,7 +616,7 @@ function ensureDashboard_(ss, preferredMonth) {
   sheet.getRange(12, 1, categories.length, 1).setValues(categories.map((value) => [value]));
   sheet.getRange(12, 2, categories.length, 1).setFormulas(categories.map((_, index) => {
     const row = index + 12;
-    return [`=SUMIFS('출금관리'!$J:$J,'출금관리'!$I:$I,A${row},'출금관리'!$E:$E,"<>네이버페이",'출금관리'!$B:$B,">="&${start},'출금관리'!$B:$B,"<"&${end})+SUMIFS('네이버페이 확인대기'!$D:$D,'네이버페이 확인대기'!$G:$G,A${row},'네이버페이 확인대기'!$B:$B,">="&${start},'네이버페이 확인대기'!$B:$B,"<"&${end})+IF(A${row}="기타·확인필요",SUMIFS('네이버페이 확인대기'!$D:$D,'네이버페이 확인대기'!$G:$G,"",'네이버페이 확인대기'!$B:$B,">="&${start},'네이버페이 확인대기'!$B:$B,"<"&${end}),0)`];
+    return [`=SUMIFS('출금관리'!$J:$J,'출금관리'!$I:$I,A${row},'출금관리'!$H:$H,"지출",'출금관리'!$B:$B,">="&${start},'출금관리'!$B:$B,"<"&${end})`];
   })).setNumberFormat('#,##0원');
 
   buildExpenseCalendar_(ss, sheet, current);
@@ -700,14 +689,6 @@ function buildExpenseCalendar_(ss, sheet, month) {
 
 function refreshCalendarNotes_(ss, dashboard, month) {
   if (!/^20\d{2}-(0[1-9]|1[0-2])$/.test(month || '')) return;
-  const reviewById = new Map();
-  const review = ss.getSheetByName(LEDGER.naverReviewSheet);
-  if (review && review.getLastRow() >= 2) {
-    review.getRange(2, 1, review.getLastRow() - 1, 9).getDisplayValues().forEach((row) => {
-      reviewById.set(cleanText_(row[0]), {merchant: cleanText_(row[5]), category: cleanText_(row[6])});
-    });
-  }
-
   const byDate = new Map();
   const outgoing = ss.getSheetByName(LEDGER.outgoingSheet);
   if (outgoing && outgoing.getLastRow() >= 2) {
@@ -715,11 +696,10 @@ function refreshCalendarNotes_(ss, dashboard, month) {
       if (cleanText_(row[7]) !== '지출') return;
       const date = row[1] instanceof Date ? Utilities.formatDate(row[1], 'Asia/Seoul', 'yyyy-MM-dd') : normalizeDate_(row[1]);
       if (date.slice(0, 7) !== month) return;
-      const reviewValue = reviewById.get(cleanText_(row[0])) || {};
       const naverMarker = cleanText_(row[11]).match(/\[(?:네이버페이 사용처|네이버페이 결제):\s*([^\/\]]+)/);
       const time = cleanText_(row[2]) || '시간 미제공';
-      const merchant = reviewValue.merchant || (naverMarker ? cleanText_(naverMarker[1]) : '') || cleanText_(row[5]) || '사용처 확인필요';
-      const category = reviewValue.category || cleanText_(row[8]) || '기타·확인필요';
+      const merchant = cleanText_(row[5]) || (naverMarker ? cleanText_(naverMarker[1]) : '') || '사용처 확인필요';
+      const category = cleanText_(row[8]) || '기타·확인필요';
       const amount = Number(row[9]) || Number(row[6]) || 0;
       if (!byDate.has(date)) byDate.set(date, []);
       byDate.get(date).push({time: time, merchant: merchant, category: category, amount: amount});
@@ -761,100 +741,6 @@ function selectedMonth_(ss) {
   return /^20\d{2}-(0[1-9]|1[0-2])$/.test(value) ? value : monthFromTitle_(ss.getName());
 }
 
-function refreshNaverPayReview_(ss) {
-  let sheet = ss.getSheetByName(LEDGER.naverReviewSheet);
-  if (!sheet) sheet = ss.insertSheet(LEDGER.naverReviewSheet);
-  if (sheet.getLastRow() === 0) {
-    sheet.getRange(1, 1, 1, 9).setValues([[
-      '거래ID', '날짜', '시간', '금액', '은행 표시내용', '실제 사용처', '소비분류', '메모', '상태'
-    ]]);
-  }
-  sheet.setFrozenRows(1);
-  sheet.getRange('A1:I1').setBackground('#fce8b2').setFontWeight('bold');
-  sheet.setColumnWidth(1, 190);
-  sheet.setColumnWidth(2, 100);
-  sheet.setColumnWidth(3, 85);
-  sheet.setColumnWidth(4, 100);
-  sheet.setColumnWidth(5, 240);
-  sheet.setColumnWidth(6, 180);
-  sheet.setColumnWidth(7, 170);
-  sheet.setColumnWidth(8, 220);
-  sheet.setColumnWidth(9, 100);
-
-  const known = new Set();
-  if (sheet.getLastRow() >= 2) {
-    sheet.getRange(2, 1, sheet.getLastRow() - 1, 1).getDisplayValues().flat().forEach((id) => known.add(id));
-  }
-  const outgoing = ss.getSheetByName(LEDGER.outgoingSheet);
-  const pending = [];
-  if (outgoing.getLastRow() >= 2) {
-    outgoing.getRange(2, 1, outgoing.getLastRow() - 1, 12).getValues().forEach((row) => {
-      const id = cleanText_(row[0]);
-      const bank = cleanText_(row[3]);
-      const method = cleanText_(row[4]);
-      const description = cleanText_(row[5]);
-      const bucket = cleanText_(row[7]);
-      const isNaverPay = method === '네이버페이' || /네이버페이|네이버파이낸셜/.test(bank + ' ' + description);
-      if (!id || known.has(id) || bucket !== '지출' || !isNaverPay) return;
-      pending.push([id, row[1], row[2], row[6], description, '', '', '', '확인필요']);
-    });
-  }
-  if (pending.length) {
-    const startRow = sheet.getLastRow() + 1;
-    ensureSheetCapacity_(sheet, startRow + pending.length - 1, 9);
-    sheet.getRange(startRow, 1, pending.length, 9).setValues(pending);
-    sheet.getRange(startRow, 2, pending.length, 1).setNumberFormat('yyyy-mm-dd');
-    sheet.getRange(startRow, 4, pending.length, 1).setNumberFormat('#,##0원');
-    const validation = SpreadsheetApp.newDataValidation()
-      .requireValueInList(LEDGER.expenseCategories.filter((value) => value !== '내부이체'), true)
-      .setAllowInvalid(false).build();
-    sheet.getRange(startRow, 7, pending.length, 1).setDataValidation(validation);
-  }
-  if (sheet.getLastRow() >= 2) {
-    const count = sheet.getLastRow() - 1;
-    sheet.getRange(2, 9, count, 1).setFormulas(Array.from({length: count}, (_, index) => {
-      const row = index + 2;
-      return ['=IF(AND(F' + row + '<>"",G' + row + '<>"",G' + row + '<>"기타·확인필요"),"입력완료","확인필요")'];
-    }));
-  }
-  return sheet;
-}
-
-function syncNaverPayReviews() {
-  const ss = SpreadsheetApp.getActive();
-  const review = refreshNaverPayReview_(ss);
-  const outgoing = ss.getSheetByName(LEDGER.outgoingSheet);
-  if (review.getLastRow() < 2 || outgoing.getLastRow() < 2) {
-    SpreadsheetApp.getUi().alert('반영할 네이버페이 확인 내역이 없습니다.');
-    return;
-  }
-  const outgoingRows = outgoing.getRange(2, 1, outgoing.getLastRow() - 1, 12).getValues();
-  const rowById = new Map(outgoingRows.map((row, index) => [cleanText_(row[0]), index + 2]));
-  const rows = review.getRange(2, 1, review.getLastRow() - 1, 9).getValues();
-  let updated = 0;
-  rows.forEach((row) => {
-    const id = cleanText_(row[0]);
-    const merchant = cleanText_(row[5]);
-    const category = cleanText_(row[6]);
-    const memo = cleanText_(row[7]);
-    const targetRow = rowById.get(id);
-    if (!targetRow || !merchant || !category || category === '기타·확인필요') return;
-    outgoing.getRange(targetRow, 9).setValue(category);
-    const previous = cleanText_(outgoing.getRange(targetRow, 12).getValue());
-    outgoing.getRange(targetRow, 12).setValue(naverPayNote_(previous, merchant, memo));
-    updated += 1;
-  });
-  ensureDashboard_(ss);
-  SpreadsheetApp.flush();
-  SpreadsheetApp.getUi().alert('네이버페이 확인 내역 ' + updated + '건을 출금관리에 반영했습니다.');
-}
-
-function naverPayNote_(previous, merchant, memo) {
-  const cleaned = cleanText_(previous).replace(/(?:^|\s)\[네이버페이 사용처:[^\]]*\]/g, '').trim();
-  const detail = '[네이버페이 사용처: ' + merchant + (memo ? ' / ' + memo : '') + ']';
-  return cleanText_((cleaned ? cleaned + ' ' : '') + detail);
-}
-
 function doPost(event) {
   try {
     const payload = JSON.parse(event && event.postData && event.postData.contents || '{}');
@@ -881,31 +767,31 @@ function doPost(event) {
 
 function importNaverPayDetails_(ss, records) {
   requireLedgerSheets_(ss);
-  const review = refreshNaverPayReview_(ss);
   const log = ensureNaverSyncLog_(ss);
-  const rowCount = Math.max(review.getLastRow() - 1, 0);
+  const outgoing = ss.getSheetByName(LEDGER.outgoingSheet);
+  const rowCount = Math.max(outgoing.getLastRow() - 1, 0);
   if (!rowCount) return {received: records.length, matched: 0, unmatched: records.length, duplicate: 0};
 
-  const reviewRows = review.getRange(2, 1, rowCount, 9).getValues();
-  const outgoing = ss.getSheetByName(LEDGER.outgoingSheet);
   const outgoingRows = outgoing.getRange(2, 1, outgoing.getLastRow() - 1, 12).getValues();
-  const reviewIds = new Set(reviewRows.map((row) => cleanText_(row[0])));
   const claimed = new Set();
-  const claimedOutgoing = new Set();
   const knownPaymentIds = new Set();
+  const knownDetailKeys = new Set();
   const logRowByPaymentId = new Map();
   if (log.getLastRow() >= 2) {
     log.getRange(2, 6, log.getLastRow() - 1, 1).getDisplayValues().flat().forEach((paymentId, index) => {
       if (paymentId) logRowByPaymentId.set(paymentId, index + 2);
     });
   }
-  reviewRows.forEach((row) => {
-    const matches = cleanText_(row[7]).match(/결제번호:\s*([^\s|\]]+)/g) || [];
-    matches.forEach((value) => knownPaymentIds.add(value.replace(/^결제번호:\s*/, '')));
-  });
   outgoingRows.forEach((row) => {
-    const matches = cleanText_(row[11]).match(/결제번호:\s*([^\s|\]]+)/g) || [];
+    const note = cleanText_(row[11]);
+    const matches = note.match(/결제번호:\s*([^\s|\/\]]+)/g) || [];
     matches.forEach((value) => knownPaymentIds.add(value.replace(/^결제번호:\s*/, '')));
+    const marker = note.match(/\[네이버페이 결제:\s*([^\/\]]+)/);
+    const shownAmount = note.match(/표시금액:\s*([\d,]+)원/);
+    if (marker && shownAmount) {
+      const date = row[1] instanceof Date ? Utilities.formatDate(row[1], 'Asia/Seoul', 'yyyy-MM-dd') : normalizeDate_(row[1]);
+      knownDetailKeys.add(naverDetailKey_(date, row[2], Number(shownAmount[1].replace(/,/g, '')), marker[1]));
+    }
   });
 
   let matched = 0;
@@ -917,40 +803,23 @@ function importNaverPayDetails_(ss, records) {
       duplicate += 1;
       return;
     }
+    const detailKey = naverDetailKey_(detail.date, detail.time, detail.amount, detail.merchant || detail.item);
+    if (!detail.paymentId && knownDetailKeys.has(detailKey)) {
+      duplicate += 1;
+      return;
+    }
     const candidates = [];
-    reviewRows.forEach((row, index) => {
+    outgoingRows.forEach((row, index) => {
       if (claimed.has(index)) return;
+      if (!cleanText_(row[0]) || cleanText_(row[7]) !== '지출') return;
       const date = row[1] instanceof Date ? Utilities.formatDate(row[1], 'Asia/Seoul', 'yyyy-MM-dd') : normalizeDate_(row[1]);
-      const score = naverMatchScore_(date, row[3], row[2], detail);
+      const score = naverMatchScore_(date, row[6], row[2], detail);
       if (score === null) return;
-      candidates.push({index: index, score: score});
+      const naverHint = cleanText_(row[4]) === '네이버페이' || /네이버페이|네이버파이낸셜/.test(cleanText_(row[3]) + ' ' + cleanText_(row[5]));
+      candidates.push({index: index, score: score + (naverHint ? 0 : 172800)});
     });
     candidates.sort((a, b) => a.score - b.score);
     if (!candidates.length) {
-      const outgoingCandidates = [];
-      outgoingRows.forEach((row, index) => {
-        const id = cleanText_(row[0]);
-        if (!id || reviewIds.has(id) || claimedOutgoing.has(index) || cleanText_(row[7]) !== '지출') return;
-        const date = row[1] instanceof Date ? Utilities.formatDate(row[1], 'Asia/Seoul', 'yyyy-MM-dd') : normalizeDate_(row[1]);
-        const score = naverMatchScore_(date, row[6], row[2], detail);
-        if (score !== null) outgoingCandidates.push({index: index, score: score});
-      });
-      outgoingCandidates.sort((a, b) => a.score - b.score);
-      if (outgoingCandidates.length) {
-        const outgoingIndex = outgoingCandidates[0].index;
-        const outgoingRow = outgoingRows[outgoingIndex];
-        const description = cleanText_([detail.merchant, detail.item].filter(Boolean).join(' '));
-        const suggested = category_(description, '', '출금', '지출', '네이버페이');
-        if (cleanText_(outgoingRow[8]) === '기타·확인필요' && suggested !== '기타·확인필요') {
-          outgoing.getRange(outgoingIndex + 2, 9).setValue(suggested);
-          outgoingRow[8] = suggested;
-        }
-        outgoing.getRange(outgoingIndex + 2, 12).setValue(naverDirectNote_(outgoingRow[11], detail));
-        claimedOutgoing.add(outgoingIndex);
-        if (detail.paymentId) knownPaymentIds.add(detail.paymentId);
-        matched += 1;
-        return;
-      }
       unmatched += 1;
       if (!detail.paymentId || !logRowByPaymentId.has(detail.paymentId)) {
         unmatchedRows.push(naverSyncLogRow_(detail, '은행 거래와 미일치'));
@@ -960,18 +829,22 @@ function importNaverPayDetails_(ss, records) {
 
     const index = candidates[0].index;
     claimed.add(index);
-    const row = reviewRows[index];
-    const merchant = detail.merchant || detail.item || '사용처 확인필요';
+    const row = outgoingRows[index];
+    const merchant = detail.merchant || detail.item || cleanText_(row[5]) || '사용처 확인필요';
     const description = cleanText_([detail.merchant, detail.item].filter(Boolean).join(' '));
     const suggested = category_(description, '', '출금', '지출', '네이버페이');
-    row[5] = cleanText_(row[5]) || merchant;
-    if (!cleanText_(row[6]) && suggested !== '기타·확인필요') row[6] = suggested;
-    row[7] = naverSyncMemo_(row[7], detail);
-    review.getRange(index + 2, 6, 1, 3).setValues([[safeCellText_(row[5]), safeCellText_(row[6]), safeCellText_(row[7])]]);
+    const originalDescription = cleanText_(row[5]);
+    row[5] = merchant;
+    if ((!cleanText_(row[8]) || cleanText_(row[8]) === '기타·확인필요') && suggested !== '기타·확인필요') row[8] = suggested;
+    row[11] = naverLedgerNote_(row[11], detail, originalDescription);
+    outgoing.getRange(index + 2, 6).setValue(safeCellText_(row[5]));
+    outgoing.getRange(index + 2, 9).setValue(safeCellText_(row[8] || '기타·확인필요'));
+    outgoing.getRange(index + 2, 12).setValue(safeCellText_(row[11]));
     if (detail.paymentId && logRowByPaymentId.has(detail.paymentId)) {
       log.getRange(logRowByPaymentId.get(detail.paymentId), 7).setValue('추후 매칭완료');
     }
     if (detail.paymentId) knownPaymentIds.add(detail.paymentId);
+    knownDetailKeys.add(detailKey);
     matched += 1;
   });
 
@@ -983,7 +856,6 @@ function importNaverPayDetails_(ss, records) {
     log.getRange(log.getLastRow() - unmatchedRows.length + 1, 2, unmatchedRows.length, 1).setNumberFormat('yyyy-mm-dd hh:mm:ss');
     log.getRange(log.getLastRow() - unmatchedRows.length + 1, 3, unmatchedRows.length, 1).setNumberFormat('#,##0원');
   }
-  refreshNaverPayReview_(ss);
   ensureDashboard_(ss);
   SpreadsheetApp.flush();
   return {received: records.length, matched: matched, unmatched: unmatched, duplicate: duplicate};
@@ -1005,23 +877,16 @@ function normalizeNaverPayDetail_(record) {
   };
 }
 
-function naverSyncMemo_(previous, detail) {
-  const payment = detail.paymentId ? '결제번호: ' + detail.paymentId : '';
-  const item = detail.item ? '상품: ' + detail.item : '';
-  const shownAmount = detail.amount ? '네이버페이 표시금액: ' + Number(detail.amount).toLocaleString('ko-KR') + '원' : '';
-  const parts = [payment, item, shownAmount, detail.detailUrl].filter(Boolean).join(' | ');
-  const marker = '[NPay 자동동기화 ' + parts + ']';
-  return cleanText_((cleanText_(previous) ? cleanText_(previous) + ' ' : '') + marker).slice(0, 5000);
-}
-
-function naverDirectNote_(previous, detail) {
+function naverLedgerNote_(previous, detail, originalDescription) {
   if (detail.paymentId && cleanText_(previous).indexOf('결제번호: ' + detail.paymentId) >= 0) return cleanText_(previous);
   const merchant = detail.merchant || detail.item || '사용처 확인필요';
   const item = detail.item ? '상품: ' + detail.item : '';
   const payment = detail.paymentId ? '결제번호: ' + detail.paymentId : '';
   const shownAmount = detail.amount ? '표시금액: ' + Number(detail.amount).toLocaleString('ko-KR') + '원' : '';
-  const marker = '[네이버페이 결제: ' + [merchant, payment, item, shownAmount, detail.detailUrl].filter(Boolean).join(' / ') + ']';
-  return cleanText_((cleanText_(previous) ? cleanText_(previous) + ' ' : '') + marker).slice(0, 5000);
+  const source = originalDescription && originalDescription !== merchant ? '은행 표시내용: ' + originalDescription : '';
+  const marker = '[네이버페이 결제: ' + [merchant, payment, item, shownAmount, source, detail.detailUrl].filter(Boolean).join(' / ') + ']';
+  const cleaned = cleanText_(previous).replace(/(?:^|\s)\[(?:NPay 자동동기화|네이버페이 사용처|네이버페이 결제):?[^\]]*\]/g, '').trim();
+  return cleanText_((cleaned ? cleaned + ' ' : '') + marker).slice(0, 5000);
 }
 
 function naverMatchScore_(date, amount, time, detail) {
@@ -1029,6 +894,10 @@ function naverMatchScore_(date, amount, time, detail) {
   const distance = timeDistance_(cleanText_(time), detail.time);
   if (Number(amount) === Number(detail.amount)) return distance;
   return distance <= 90 ? 86400 + distance : null;
+}
+
+function naverDetailKey_(date, time, amount, merchant) {
+  return [normalizeDate_(date), cleanText_(time), Number(amount) || 0, cleanText_(merchant)].join('|');
 }
 
 function ensureNaverSyncLog_(ss) {
