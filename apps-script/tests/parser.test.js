@@ -90,6 +90,9 @@ assert.equal(context.naverMatchScore_('2026-08-20', 16266, '19:53:03', {
 assert.equal(context.naverMatchScore_('2026-08-20', 16266, '20:00:00', {
   date: '2026-08-20', time: '19:53:00', amount: 17500
 }), null);
+assert.equal(context.category_('Apple Services', '', '출금', '지출', '네이버페이'), '구독·디지털');
+assert.equal(context.category_('설빙전북대점', '', '출금', '지출', '네이버페이'), '카페·간식');
+assert.equal(context.category_('비비고김치100G 외 2종', '', '출금', '지출', '네이버페이'), '식료품·편의점');
 assert.equal(
   context.naverDetailKey_('2026.08.20', '19:53:00', 17500, ' 예시매장 '),
   '2026-08-20|19:53:00|17500|예시매장'

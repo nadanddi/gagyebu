@@ -465,14 +465,15 @@ function category_(description, type, direction, bucket, method) {
   }
   if (method === '상품권 충전') return '지역상품권·온누리충전';
   if (/전력|가스요금|수도|통신요금/.test(description)) return '공과금';
-  if (/PC|피시|노래방|영화|유람선/i.test(description)) return '문화·여가';
+  if (/PC방|피시방|노래방|영화|유람선|넥슨캐시/i.test(description)) return '문화·여가';
   if (/의원|병원|약국/.test(description)) return '의료·건강';
   if (/헤어|미용/.test(description)) return '미용';
-  if (/주유|교통|티머니|버스|택시|철도/.test(description)) return '교통비';
-  if (/커피|카페|스타벅스|빽다방|제과|베이커리/.test(description)) return '카페·간식';
-  if (/밥상|찌개|소바|어묵|타코야끼|식당|고기|분식|치킨|피자/.test(description)) return '식비';
-  if (/마트|편의점|지에스25|GS25|세븐일레븐|CU|자연드림/.test(description)) return '식료품·편의점';
-  if (/ANTHROPIC|NETFLIX|YOUTUBE|구독/i.test(description)) return '구독·디지털';
+  if (/주유|교통|티머니|버스|택시|철도|한국자동차환경협회/.test(description)) return '교통비';
+  if (/커피|카페|스타벅스|빽다방|제과|베이커리|설빙|카이막|모찌/.test(description)) return '카페·간식';
+  if (/밥상|찌개|소바|어묵|타코야끼|식당|고기|분식|치킨|피자|떡볶이|카츠호|황양반|황올/.test(description)) return '식비';
+  if (/마트|편의점|지에스25|GS25|세븐일레븐|CU|자연드림|초코에몽|이클립스|닭가슴살|혜자|비비고김치|드럼스틱버블/.test(description)) return '식료품·편의점';
+  if (/ANTHROPIC|NETFLIX|YOUTUBE|APPLE SERVICES|구독/i.test(description)) return '구독·디지털';
+  if (/다이소|에프알엘코리아/.test(description)) return '쇼핑·생활';
   return '기타·확인필요';
 }
 

@@ -104,7 +104,7 @@
     for (let index = statusIndex >= 0 ? statusIndex + 1 : 0; index < lines.length; index += 1) {
       const line = lines[index];
       if (/^[\d,]+\s*원/.test(line) || /\d{1,2}[.\/-]\s*\d{1,2}[.]?\s+\d{1,2}:\d{2}\s*결제/.test(line)) break;
-      if (/^(포인트 뽑기|문의하기|영수증|결제완료)$/.test(line) || /적립/.test(line)) continue;
+      if (/^(포인트 뽑기|문의하기|영수증|결제완료)$/.test(line) || /적립|자세히 보기|결제완료/.test(line)) continue;
       title = line.replace(/\s*[>›〉]$/, '').trim();
       if (title) break;
     }

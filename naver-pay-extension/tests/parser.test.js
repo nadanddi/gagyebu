@@ -48,6 +48,11 @@ assert.deepEqual(parser.parseHistoryCard([
   amount: 17500,
   detailUrl: 'https://orders.pay.naver.com/instantPay/detail/20260820NP1000000003'
 });
+assert.equal(parser.parseHistoryCard([
+  '결제완료',
+  '자세히 보기 결제완료',
+  '10,000원 | 8. 20. 19:53 결제'
+].join('\n'), '2026', '' ).merchant, '');
 assert.equal(parser.scanDecision([
   {date: '2026-09-10'}, {date: '2026-09-01'}
 ], '2026-08', false), 'continue');
