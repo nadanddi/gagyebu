@@ -178,6 +178,39 @@ function getUploaderConfig() {
  * Saves and analyzes one browser-selected file. The dialog calls this method
  * sequentially for every file in the multi-select list.
  */
+/** Returns recent supported files that the current user can access in Drive. */
+function listDriveUploadCandidates() {
+  const mimeTypes = [
+    'text/csv', 'application/pdf', 'application/vnd.ms-excel',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+  ];
+  const response = Drive.Files.list({
+    q: 'trashed = false and (' + mimeTypes.map((type) => "mimeType = '" + type + "'").join(' or ') + ')',
+    orderBy: 'modifiedTime desc', pageSize: 100,
+    fields: 'files(id,name,mimeType,size,modifiedTime,webViewLink)'
+  });
+  return (response.files || []).filter((file) => {
+    return LEDGER.extensions.indexOf(extension_(file.name)) >= 0 && Number(file.size || 0) <= LEDGER.maxFileBytes;
+  }).map((file) => ({
+    id: file.id, name: file.name,
+    mimeType: file.mimeType || mimeFromExtension_(extension_(file.name)),
+    size: Number(file.size || 0), modifiedTime: file.modifiedTime || '',
+    url: file.webViewLink || ''
+  }));
+}
+
+/** Loads a selected Drive file into the browser for the existing password flow. */
+function getDriveUploadPayload(fileId) {
+  const file = DriveApp.getFileById(String(fileId || ''));
+  const name = file.getName();
+  const ext = extension_(name);
+  if (LEDGER.extensions.indexOf(ext) < 0) throw new Error('CSV, XLS, XLSX, PDF만 가져올 수 있습니다.');
+  const blob = file.getBlob();
+  const bytes = blob.getBytes();
+  if (bytes.length > LEDGER.maxFileBytes) throw new Error('8MB를 넘는 파일입니다: ' + name);
+  return {id: file.getId(), name: name, mimeType: blob.getContentType() || mimeFromExtension_(ext), size: bytes.length, base64: Utilities.base64Encode(bytes)};
+}
+
 function analyzeUploadedFile(payload) {
   validateUploadPayload_(payload);
   const ownerLabels = parseOwnerLabels_(payload.ownerLabels);
@@ -191,7 +224,9 @@ function analyzeUploadedFile(payload) {
   const mime = payload.mimeType || mimeFromExtension_(extension_(payload.name));
   const blob = Utilities.newBlob(bytes, mime, safeFileName_(payload.name));
   const originalFolder = getOrCreateChildFolder_(getOrCreateFolder_(LEDGER.uploadRoot), LEDGER.uploadFolder);
-  const original = originalFolder.createFile(blob);
+  const original = payload.sourceFileId
+    ? DriveApp.getFileById(String(payload.sourceFileId))
+    : originalFolder.createFile(blob);
 
   try {
     if (payload.pdfEncrypted && !payload.pdfText) {
