@@ -62,6 +62,7 @@ function onEdit(event) {
 }
 
 function showUploadDialog() {
+  ScriptApp.requireAllScopes(ScriptApp.AuthMode.FULL);
   setupLedgerUploader_();
   const html = HtmlService.createHtmlOutputFromFile('Upload')
     .setWidth(760)
@@ -70,6 +71,7 @@ function showUploadDialog() {
 }
 
 function setupLedgerUploader() {
+  ScriptApp.requireAllScopes(ScriptApp.AuthMode.FULL);
   setupLedgerUploader_();
   SpreadsheetApp.getUi().alert('업로드 기능을 사용할 준비가 되었습니다.');
 }
