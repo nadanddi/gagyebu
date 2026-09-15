@@ -138,6 +138,7 @@ function registerNewMonth() {
 }
 
 function showNaverPaySyncSetup() {
+  ScriptApp.requireAllScopes(ScriptApp.AuthMode.FULL);
   const ss = SpreadsheetApp.getActive();
   PropertiesService.getScriptProperties().setProperty(LEDGER.spreadsheetIdProperty, ss.getId());
   ensureNaverPaySyncToken_();
