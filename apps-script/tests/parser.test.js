@@ -111,4 +111,22 @@ assert.deepEqual(
 );
 assert.equal(context.secureEquals_('same-token', 'same-token'), true);
 assert.equal(context.secureEquals_('same-token', 'other-token'), false);
+assert.equal(context.merchantKey_('(주)세광'), '세광');
+assert.equal(context.merchantKey_('지에스 25 전북대점'), 'GS25전북대점');
+assert.equal(
+  context.matchSimpleRule_('GS25 전북대점', [{key: 'GS25전북대점', example: 'GS25 전북대점', category: '생활용품'}]).category,
+  '생활용품'
+);
+assert.equal(context.simpleFallbackCategory_({
+  direction: '출금', description: '예시식당', type: '체크카드결제', bucket: '지출'
+}), '식비');
+const simpleImported = context.simpleLedgerRow_({
+  id: 'auto-sample', date: '2026-09-15', time: '12:00:00', bank: '토스뱅크',
+  description: 'GS25 전북대점', type: '체크카드결제', direction: '출금', amount: 6500,
+  bucket: '지출', note: ''
+}, [{key: 'GS25전북대점', example: 'GS25 전북대점', category: '생활용품'}]);
+assert.deepEqual(Array.from(simpleImported.slice(1, 12)), [
+  '지출', '생활용품', '', 6500, '토스카드', '토스', '', 'GS25 전북대점',
+  '원본 토스뱅크 12:00:00 / 유형: 체크카드결제 / 분류규칙: GS25 전북대점', '2026-09', 'auto-sample'
+]);
 console.log('parser tests passed');

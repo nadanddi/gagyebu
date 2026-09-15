@@ -25,12 +25,16 @@ const LEDGER = Object.freeze({
 });
 
 function onOpen() {
-  SpreadsheetApp.getUi().createMenu('가계부')
+  const ss = SpreadsheetApp.getActive();
+  const menu = SpreadsheetApp.getUi().createMenu('가계부')
     .addItem('거래내역 여러 파일 업로드', 'showUploadDialog')
+    .addItem('선택 거래를 같은 상호로 분류', 'applySelectedMerchantRule')
+    .addItem('분류 규칙 보기', 'showCategoryRules')
     .addItem('새 월 등록', 'registerNewMonth')
     .addSeparator()
-    .addItem('월별 대시보드 보기', 'showDashboard')
-    .addItem('네이버페이 자동 동기화 설정', 'showNaverPaySyncSetup')
+    .addItem('월별 대시보드 보기', 'showDashboard');
+  if (!isSimpleLedger_(ss)) menu.addItem('네이버페이 자동 동기화 설정', 'showNaverPaySyncSetup');
+  menu
     .addSeparator()
     .addItem('자동화 초기 설정', 'setupLedgerUploader')
     .addItem('가져오기 기록 보기', 'showImportLog')
@@ -41,6 +45,10 @@ function onEdit(event) {
   if (!event || !event.range) return;
   const sheet = event.range.getSheet();
   const ss = event.source;
+  if (isSimpleLedger_(ss)) {
+    handleSimpleLedgerEdit_(event);
+    return;
+  }
   if (sheet.getName() === LEDGER.dashboardSheet && event.range.getA1Notation() === 'B2') {
     ensureDashboard_(ss, cleanText_(event.value));
     return;
@@ -67,6 +75,10 @@ function setupLedgerUploader() {
 function setupLedgerUploader_() {
   const ss = SpreadsheetApp.getActive();
   PropertiesService.getScriptProperties().setProperty(LEDGER.spreadsheetIdProperty, ss.getId());
+  if (isSimpleLedger_(ss)) {
+    setupSimpleLedger_(ss);
+    return;
+  }
   requireLedgerSheets_(ss);
   ensureLogSheet_(ss);
   ensureMonthRegistry_(ss);
@@ -75,12 +87,20 @@ function setupLedgerUploader_() {
 
 function showImportLog() {
   const ss = SpreadsheetApp.getActive();
+  if (isSimpleLedger_(ss)) {
+    ss.setActiveSheet(ensureSimpleImportLog_(ss));
+    return;
+  }
   const sheet = ensureLogSheet_(ss);
   ss.setActiveSheet(sheet);
 }
 
 function showDashboard() {
   const ss = SpreadsheetApp.getActive();
+  if (isSimpleLedger_(ss)) {
+    ss.setActiveSheet(ss.getSheetByName('대시보드'));
+    return;
+  }
   ensureMonthRegistry_(ss);
   const sheet = ensureDashboard_(ss);
   ss.setActiveSheet(sheet);
@@ -96,6 +116,15 @@ function registerNewMonth() {
     return;
   }
   const ss = SpreadsheetApp.getActive();
+  if (isSimpleLedger_(ss)) {
+    const dashboard = ss.getSheetByName('대시보드');
+    dashboard.getRange('B3')
+      .setValue(new Date(month + '-01T00:00:00+09:00'))
+      .setNumberFormat('yyyy-mm');
+    ss.setActiveSheet(dashboard);
+    ui.alert(month + ' 월이 선택되었습니다. 이제 거래내역 파일을 업로드할 수 있습니다.');
+    return;
+  }
   ensureMonthRegistry_(ss, month);
   const dashboard = ensureDashboard_(ss, month);
   dashboard.getRange('B2').setValue(month);
@@ -183,11 +212,13 @@ function analyzeUploadedFile(payload) {
       transactions: transactions
     };
   } catch (error) {
-    appendImportLog_({
+    const entry = {
       fileName: original.getName(), fileUrl: original.getUrl(), bank: '',
       found: 0, added: 0, duplicate: 0, skipped: 0,
       status: '분석실패', message: error.message
-    });
+    };
+    if (isSimpleLedger_(SpreadsheetApp.getActive())) appendSimpleImportLog_(SpreadsheetApp.getActive(), entry);
+    else appendImportLog_(entry);
     throw error;
   }
 }
@@ -202,6 +233,7 @@ function commitImportBatch(payload) {
   }
 
   const ss = SpreadsheetApp.getActive();
+  if (isSimpleLedger_(ss)) return commitSimpleLedgerBatch_(ss, payload);
   requireLedgerSheets_(ss);
   ensureLogSheet_(ss);
   PropertiesService.getUserProperties().setProperty('OWNER_LABELS', String(payload.ownerLabels || ''));
@@ -737,6 +769,7 @@ function columnLetter_(column) {
 }
 
 function selectedMonth_(ss) {
+  if (isSimpleLedger_(ss)) return simpleSelectedMonth_(ss);
   const sheet = ss.getSheetByName(LEDGER.dashboardSheet);
   const value = sheet ? sheet.getRange('B2').getDisplayValue() : '';
   return /^20\d{2}-(0[1-9]|1[0-2])$/.test(value) ? value : monthFromTitle_(ss.getName());
@@ -1017,6 +1050,319 @@ function expandNativeTablesBestEffort_(ss) {
   } catch (error) {
     console.warn('표 범위 확장 보류: ' + error.message);
   }
+}
+
+/**
+ * New template adapter. The new household ledger intentionally keeps one
+ * transaction table instead of the legacy incoming/outgoing split.
+ */
+function isSimpleLedger_(ss) {
+  return Boolean(ss && ss.getSheetByName('거래내역') && ss.getSheetByName('분류설정'));
+}
+
+function setupSimpleLedger_(ss) {
+  const transactions = ss.getSheetByName('거래내역');
+  const headers = transactions.getRange(5, 1, 1, 12).getDisplayValues()[0];
+  if (headers.join('|') !== '거래일|구분|대분류|소분류|금액|결제방식|출금계좌|입금계좌|상호명·상대방|메모|기준월|연결번호') {
+    throw new Error('새 가계부의 거래내역 헤더를 찾지 못했습니다. A5:L5를 확인하세요.');
+  }
+  ensureSimpleRuleSheet_(ss);
+  ensureSimpleSourceSheet_(ss);
+  ensureSimpleImportLog_(ss);
+  expandSimpleDashboardFormulaRanges_(ss);
+}
+
+function simpleSelectedMonth_(ss) {
+  const value = ss.getSheetByName('대시보드').getRange('B3').getValue();
+  if (value instanceof Date) return Utilities.formatDate(value, 'Asia/Seoul', 'yyyy-MM');
+  const match = cleanText_(value).match(/^(20\d{2})-(\d{2})/);
+  return match ? match[0] : Utilities.formatDate(new Date(), 'Asia/Seoul', 'yyyy-MM');
+}
+
+function expandSimpleDashboardFormulaRanges_(ss) {
+  const dashboard = ss.getSheetByName('대시보드');
+  if (!dashboard) return;
+  dashboard.getDataRange().getFormulas().forEach((row, rowIndex) => {
+    row.forEach((formula, columnIndex) => {
+      if (!formula) return;
+      const updated = formula.replace(/\$205\b/g, '$5000');
+      if (updated !== formula) dashboard.getRange(rowIndex + 1, columnIndex + 1).setFormula(updated);
+    });
+  });
+}
+
+function commitSimpleLedgerBatch_(ss, payload) {
+  setupSimpleLedger_(ss);
+  PropertiesService.getUserProperties().setProperty('OWNER_LABELS', String(payload.ownerLabels || ''));
+  const files = payload.files.map(validateAnalyzedFile_);
+  const all = files.flatMap((file) => file.transactions.map((tx) => validateTransaction_(tx, file.fileId)));
+  if (all.length > 10000) throw new Error('한 번에 반영할 수 있는 거래는 10,000건 이하입니다.');
+
+  const inMonth = all.filter((row) => row.date.slice(0, 7) === payload.targetMonth);
+  const autoTopUpMatches = reconcileTossCardTopUps_(inMonth);
+  const existing = readSimpleTransactionKeys_(ss);
+  const seen = new Set(existing);
+  const fresh = [];
+  let duplicateCount = 0;
+  inMonth.forEach((row) => {
+    const key = transactionKey_(row);
+    if (seen.has(key)) duplicateCount += 1;
+    else {
+      seen.add(key);
+      row.id = 'auto-' + sha256_(key).slice(0, 16);
+      fresh.push(row);
+    }
+  });
+
+  const rules = readSimpleRules_(ss);
+  appendSimpleLedgerRows_(ss, fresh.map((row) => simpleLedgerRow_(row, rules)));
+  appendSimpleSourceRows_(ss, fresh);
+  files.forEach((file) => {
+    const fileRows = inMonth.filter((row) => row.fileId === file.fileId);
+    const added = fresh.filter((row) => row.fileId === file.fileId).length;
+    appendSimpleImportLog_(ss, {
+      fileName: file.fileName, fileUrl: file.fileUrl, bank: file.bank,
+      found: file.transactions.length, added: added, duplicate: fileRows.length - added,
+      skipped: file.transactions.length - fileRows.length, status: '완료',
+      message: file.warnings.join(' / ')
+    });
+  });
+  expandSimpleTransactionTable_(ss);
+  SpreadsheetApp.flush();
+  return {
+    added: fresh.length,
+    outgoing: fresh.filter((row) => row.direction === '출금').length,
+    incoming: fresh.filter((row) => row.direction === '입금').length,
+    duplicate: duplicateCount,
+    skippedMonth: all.length - inMonth.length,
+    targetMonth: payload.targetMonth,
+    autoTopUpMatches: autoTopUpMatches
+  };
+}
+
+function readSimpleTransactionKeys_(ss) {
+  const sheet = ensureSimpleSourceSheet_(ss);
+  if (sheet.getLastRow() < 2) return [];
+  return sheet.getRange(2, 1, sheet.getLastRow() - 1, 1).getDisplayValues().flat().filter(Boolean);
+}
+
+function simpleLedgerRow_(row, rules) {
+  const transfer = row.bucket === '내부이체';
+  const kind = transfer ? '이체' : row.direction === '출금' ? '지출' : '수입';
+  const merchant = cleanText_(row.description) || '상호 확인 필요';
+  const matchedRule = matchSimpleRule_(merchant, rules);
+  const category = transfer ? '이체' : (matchedRule ? matchedRule.category : simpleFallbackCategory_(row));
+  const sourceAccount = simpleAccountFromBank_(row.bank);
+  const topUp = /OK저축은행→토스뱅크 자동충전 대응/.test(row.note || '');
+  const fromAccount = transfer && topUp ? 'OK저축은행' : row.direction === '출금' ? sourceAccount : '';
+  const toAccount = transfer && topUp ? '토스' : row.direction === '입금' ? sourceAccount : '';
+  const memo = [
+    '원본 ' + row.bank + (row.time ? ' ' + row.time : ''),
+    row.type ? '유형: ' + row.type : '',
+    matchedRule ? '분류규칙: ' + matchedRule.example : '',
+    row.note || '',
+    !transfer && !matchedRule && category === '기타' ? '분류 확인 필요' : ''
+  ].filter(Boolean).join(' / ');
+  return [
+    toSheetDate_(row.date), kind, category, '', row.amount,
+    simplePaymentMethod_(row, sourceAccount), fromAccount, toAccount,
+    merchant, memo, row.date.slice(0, 7), row.id
+  ];
+}
+
+function simpleFallbackCategory_(row) {
+  if (row.direction === '입금') {
+    if (/이자/.test(row.description + row.type)) return '기타수입';
+    if (/환불|취소|캐시백/.test(row.description + row.type)) return '환급';
+    return '기타수입';
+  }
+  const legacy = category_(row.description, row.type, row.direction, row.bucket, paymentMethod_(row.description, row.type));
+  const map = {
+    '식비': '식비', '카페·간식': '카페·간식', '교통비': '교통', '공과금': '주거·공과금',
+    '의료·건강': '건강', '문화·여가': '취미·여가', '미용': '생활용품',
+    '식료품·편의점': '생활용품', '쇼핑·생활': '쇼핑', '지역상품권·온누리충전': '기타',
+    '구독·디지털': '기타'
+  };
+  return map[legacy] || '기타';
+}
+
+function simplePaymentMethod_(row, sourceAccount) {
+  const method = paymentMethod_(row.description, row.type);
+  if (method === '체크카드') return sourceAccount === '토스' ? '토스카드' : '카드';
+  if (method === '네이버페이') return '네이버페이 QR';
+  if (method === '상품권 충전') return /온누리/.test(row.description + row.type) ? '온누리 앱' : '지역상품권 카드';
+  return '계좌이체';
+}
+
+function simpleAccountFromBank_(bank) {
+  if (bank === '토스뱅크') return '토스';
+  if (bank === '우리은행 일반' || bank === '우리은행 N페이') return '우리은행';
+  if (bank === 'OK저축은행') return 'OK저축은행';
+  return '';
+}
+
+function firstSimpleTransactionRow_(sheet) {
+  const start = 6;
+  const length = Math.max(sheet.getLastRow() - start + 1, 1);
+  const values = sheet.getRange(start, 1, length, 1).getDisplayValues().flat();
+  const empty = values.findIndex((value) => !cleanText_(value));
+  return empty >= 0 ? start + empty : sheet.getLastRow() + 1;
+}
+
+function appendSimpleLedgerRows_(ss, rows) {
+  if (!rows.length) return;
+  const sheet = ss.getSheetByName('거래내역');
+  const start = firstSimpleTransactionRow_(sheet);
+  ensureSheetCapacity_(sheet, start + rows.length - 1, 12);
+  sheet.getRange(start, 1, rows.length, 12).setValues(rows);
+  sheet.getRange(start, 1, rows.length, 1).setNumberFormat('yyyy-mm-dd');
+  sheet.getRange(start, 5, rows.length, 1).setNumberFormat('#,##0');
+}
+
+function ensureSimpleRuleSheet_(ss) {
+  let sheet = ss.getSheetByName('분류규칙');
+  if (!sheet) {
+    sheet = ss.insertSheet('분류규칙');
+    sheet.getRange(1, 1, 1, 6).setValues([['상호키', '예시 상호', '대분류', '적용횟수', '마지막 적용일', '메모']]);
+    sheet.getRange('A1:F1').setBackground('#e8f0fe').setFontWeight('bold');
+    sheet.setFrozenRows(1);
+    sheet.setColumnWidths(1, 2, 180);
+    sheet.setColumnWidth(3, 130);
+    sheet.setColumnWidths(4, 2, 110);
+    sheet.setColumnWidth(6, 220);
+  }
+  return sheet;
+}
+
+function ensureSimpleSourceSheet_(ss) {
+  let sheet = ss.getSheetByName('원본대조');
+  if (!sheet) {
+    sheet = ss.insertSheet('원본대조');
+    sheet.getRange(1, 1, 1, 10).setValues([['거래키', '거래일', '기록은행', '적요', '거래유형', '원거래금액', '거래후잔액', '원본행', '메모', '원본링크']]);
+    sheet.getRange('A1:J1').setBackground('#eeeeee').setFontWeight('bold');
+    sheet.setFrozenRows(1);
+    sheet.hideSheet();
+  }
+  return sheet;
+}
+
+function ensureSimpleImportLog_(ss) {
+  let sheet = ss.getSheetByName('가져오기 기록');
+  if (!sheet) {
+    sheet = ss.insertSheet('가져오기 기록');
+    sheet.getRange(1, 1, 1, 10).setValues([['처리시각', '파일명', '기록은행', '발견건수', '추가건수', '중복건수', '다른월 제외', '상태', '메시지', '원본링크']]);
+    sheet.getRange('A1:J1').setBackground('#eeeeee').setFontWeight('bold');
+    sheet.setFrozenRows(1);
+    sheet.hideSheet();
+  }
+  return sheet;
+}
+
+function appendSimpleSourceRows_(ss, rows) {
+  if (!rows.length) return;
+  const sheet = ensureSimpleSourceSheet_(ss);
+  const start = sheet.getLastRow() + 1;
+  sheet.getRange(start, 1, rows.length, 10).setValues(rows.map((row) => [
+    transactionKey_(row), toSheetDate_(row.date), row.bank, row.description, row.type,
+    row.rawAmount, row.balance, row.sourceRow, row.note || '', row.fileUrl
+  ]));
+  sheet.getRange(start, 2, rows.length, 1).setNumberFormat('yyyy-mm-dd');
+  sheet.getRange(start, 6, rows.length, 2).setNumberFormat('#,##0');
+}
+
+function appendSimpleImportLog_(ss, entry) {
+  const sheet = ensureSimpleImportLog_(ss);
+  const row = sheet.getLastRow() + 1;
+  sheet.getRange(row, 1, 1, 10).setValues([[new Date(), entry.fileName, entry.bank, entry.found || 0, entry.added || 0, entry.duplicate || 0, entry.skipped || 0, entry.status, entry.message || '', entry.fileUrl || '']]);
+  sheet.getRange(row, 1).setNumberFormat('yyyy-mm-dd hh:mm:ss');
+}
+
+function expandSimpleTransactionTable_(ss) {
+  try {
+    const sheet = ss.getSheetByName('거래내역');
+    const meta = Sheets.Spreadsheets.get(ss.getId(), {fields: 'sheets(properties(sheetId,title),tables(tableId,range))'});
+    const item = (meta.sheets || []).find((candidate) => candidate.properties.title === '거래내역');
+    const table = item && (item.tables || [])[0];
+    if (!table) return;
+    const range = Object.assign({}, table.range, {endRowIndex: sheet.getLastRow(), endColumnIndex: 12});
+    Sheets.Spreadsheets.batchUpdate({requests: [{updateTable: {table: {tableId: table.tableId, range: range}, fields: 'range'}}]}, ss.getId());
+  } catch (error) {
+    console.warn('거래내역 표 범위 확장 보류: ' + error.message);
+  }
+}
+
+function merchantKey_(value) {
+  return cleanText_(value).toUpperCase()
+    .replace(/\(주\)|㈜|주식회사|\[주\]/g, '')
+    .replace(/지에스\s*25/g, 'GS25')
+    .replace(/[^0-9A-Z가-힣]/g, '');
+}
+
+function readSimpleRules_(ss) {
+  const sheet = ensureSimpleRuleSheet_(ss);
+  if (sheet.getLastRow() < 2) return [];
+  return sheet.getRange(2, 1, sheet.getLastRow() - 1, 6).getDisplayValues()
+    .filter((row) => cleanText_(row[0]) && cleanText_(row[2]))
+    .map((row) => ({key: cleanText_(row[0]), example: cleanText_(row[1]), category: cleanText_(row[2])}));
+}
+
+function matchSimpleRule_(merchant, rules) {
+  const key = merchantKey_(merchant);
+  return (rules || []).find((rule) => rule.key === key || (rule.key.length >= 4 && (key.indexOf(rule.key) >= 0 || rule.key.indexOf(key) >= 0))) || null;
+}
+
+function handleSimpleLedgerEdit_(event) {
+  const range = event.range;
+  if (range.getSheet().getName() !== '거래내역' || range.getRow() < 6 || range.getColumn() !== 3 || range.getNumRows() !== 1 || range.getNumColumns() !== 1) return;
+  const category = cleanText_(event.value);
+  if (!category || category === '이체') return;
+  applyMerchantRuleForRow_(event.source, range.getRow(), category, false);
+}
+
+function applySelectedMerchantRule() {
+  const ss = SpreadsheetApp.getActive();
+  if (!isSimpleLedger_(ss)) throw new Error('이 기능은 새 가계부의 거래내역 탭에서 사용합니다.');
+  const range = ss.getActiveRange();
+  if (!range || range.getSheet().getName() !== '거래내역' || range.getRow() < 6) throw new Error('거래내역에서 분류할 거래 행을 선택하세요.');
+  const category = cleanText_(range.getSheet().getRange(range.getRow(), 3).getDisplayValue());
+  if (!category || category === '이체') throw new Error('먼저 선택한 행의 대분류를 확정하세요.');
+  const result = applyMerchantRuleForRow_(ss, range.getRow(), category, true);
+  SpreadsheetApp.getUi().alert('“' + result.merchant + '” 규칙을 저장하고 ' + result.count + '건에 적용했습니다.');
+}
+
+function applyMerchantRuleForRow_(ss, rowNumber, category, notify) {
+  const sheet = ss.getSheetByName('거래내역');
+  const row = sheet.getRange(rowNumber, 1, 1, 12).getDisplayValues()[0];
+  const merchant = cleanText_(row[8]);
+  const key = merchantKey_(merchant);
+  if (!key) throw new Error('선택한 거래에 상호명·상대방이 없습니다.');
+  const rules = ensureSimpleRuleSheet_(ss);
+  const ruleValues = rules.getLastRow() >= 2 ? rules.getRange(2, 1, rules.getLastRow() - 1, 6).getValues() : [];
+  const existing = ruleValues.findIndex((value) => cleanText_(value[0]) === key);
+  const now = new Date();
+  const ruleRow = existing >= 0 ? existing + 2 : rules.getLastRow() + 1;
+  if (existing >= 0) rules.getRange(ruleRow, 1, 1, 6).setValues([[key, merchant, category, Number(ruleValues[existing][3]) || 0, now, '거래내역에서 확정']]);
+  else rules.appendRow([key, merchant, category, 0, now, '거래내역에서 확정']);
+
+  const start = 6;
+  const length = Math.max(sheet.getLastRow() - start + 1, 1);
+  const values = sheet.getRange(start, 1, length, 12).getValues();
+  let count = 0;
+  values.forEach((value) => {
+    if (cleanText_(value[1]) !== '지출' || !matchSimpleRule_(cleanText_(value[8]), [{key: key}])) return;
+    if (cleanText_(value[2]) !== category) count += 1;
+    value[2] = category;
+  });
+  sheet.getRange(start, 3, length, 1).setValues(values.map((value) => [value[2]]));
+  rules.getRange(ruleRow, 4).setValue(count);
+  rules.getRange(ruleRow, 5).setValue(now).setNumberFormat('yyyy-mm-dd hh:mm');
+  if (notify) SpreadsheetApp.getActive().toast('같은·유사 상호 ' + count + '건을 ' + category + '로 분류했습니다.', '가계부');
+  return {merchant: merchant, count: count};
+}
+
+function showCategoryRules() {
+  const ss = SpreadsheetApp.getActive();
+  if (isSimpleLedger_(ss)) ss.setActiveSheet(ensureSimpleRuleSheet_(ss));
 }
 
 function requireLedgerSheets_(ss) {
