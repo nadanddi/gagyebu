@@ -120,6 +120,9 @@ assert.equal(
 assert.equal(context.simpleFallbackCategory_({
   direction: '출금', description: '예시식당', type: '체크카드결제', bucket: '지출'
 }), '식비');
+assert.equal(context.simpleFallbackCategory_({
+  direction: '출금', description: 'GS25 전북대점', type: '체크카드결제', bucket: '지출'
+}), '식료품·편의점');
 const simpleImported = context.simpleLedgerRow_({
   id: 'auto-sample', date: '2026-09-15', time: '12:00:00', bank: '토스뱅크',
   description: 'GS25 전북대점', type: '체크카드결제', direction: '출금', amount: 6500,
