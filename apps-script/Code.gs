@@ -6,6 +6,7 @@ const LEDGER = Object.freeze({
   dashboardSheet: '대시보드',
   monthSheet: '월목록',
   naverSyncLogSheet: '네이버페이 동기화 기록',
+  kakaoSyncLogSheet: '카카오페이 대조 기록',
   spreadsheetIdProperty: 'LEDGER_SPREADSHEET_ID',
   naverTokenProperty: 'NAVER_PAY_SYNC_TOKEN',
   uploadRoot: '가계부_거래내역_가져오기',
@@ -193,7 +194,19 @@ function analyzeUploadedFile(payload) {
     if (payload.pdfEncrypted && !payload.pdfText) {
       throw new Error('암호는 확인했지만 PDF에서 텍스트를 읽지 못했습니다. 스캔형 암호화 PDF는 현재 지원하지 않습니다.');
     }
-    const raw = parseSavedFile_(original, payload.pdfText || '');
+    const text = payload.extractedText || payload.pdfText || '';
+    if (/카카오페이\s*거래확인증/.test(text)) {
+      const details = parseKakaoPayReceiptText_(text, original.getUrl());
+      return {
+        fileId: original.getId(), fileName: original.getName(), fileUrl: original.getUrl(),
+        bank: '카카오페이 거래확인증', detailType: 'kakaopay', details: details,
+        periods: [...new Set(details.map((row) => row.date.slice(0, 7)))].sort(),
+        warnings: payload.pdfEncrypted ? ['암호화 PDF 해제 완료(암호는 저장하지 않음)'] : [],
+        count: details.length, outgoingCount: details.length, incomingCount: 0,
+        spend: sum_(details.map((row) => row.amount)), incoming: 0, transactions: []
+      };
+    }
+    const raw = parseSavedFile_(original, text, payload.analysisBase64 || '', payload.analysisMimeType || '');
     if (payload.pdfEncrypted) raw.warnings = (raw.warnings || []).concat('암호화 PDF 해제 완료(암호는 저장하지 않음)');
     const transactions = raw.rows.map((row) => normalizeTransaction_(row, raw.bank, original, ownerLabels));
     if (!transactions.length) throw new Error('거래 행을 찾지 못했습니다. 은행명과 파일 기간을 확인하세요.');
@@ -298,10 +311,17 @@ function commitImportBatch(payload) {
   };
 }
 
-function parseSavedFile_(file, pdfText) {
+function parseSavedFile_(file, pdfText, analysisBase64, analysisMimeType) {
   const ext = extension_(file.getName());
   if (ext === 'csv') return parseCsvFile_(file);
-  if (ext === 'xls' || ext === 'xlsx') return parseExcelFile_(file);
+  if (ext === 'xls' || ext === 'xlsx') {
+    if (analysisBase64) {
+      const decoded = Utilities.base64Decode(analysisBase64);
+      const blob = Utilities.newBlob(decoded, analysisMimeType || mimeFromExtension_(ext), 'decrypted_' + file.getName());
+      return parseExcelBlob_(blob, file.getName());
+    }
+    return parseExcelFile_(file);
+  }
   if (ext === 'pdf') return pdfText ? parseWooriPdfText_(pdfText, file.getName()) : parsePdfFile_(file);
   throw new Error('지원하지 않는 파일 형식입니다: ' + ext);
 }
@@ -318,16 +338,20 @@ function parseCsvFile_(file) {
 }
 
 function parseExcelFile_(file) {
+  return parseExcelBlob_(file.getBlob(), file.getName());
+}
+
+function parseExcelBlob_(blob, fileName) {
   let tempId = '';
   try {
     const converted = Drive.Files.create(
-      {name: 'tmp_' + file.getName(), mimeType: MimeType.GOOGLE_SHEETS},
-      file.getBlob(),
+      {name: 'tmp_' + fileName, mimeType: MimeType.GOOGLE_SHEETS},
+      blob,
       {fields: 'id'}
     );
     tempId = converted.id;
     const book = SpreadsheetApp.openById(tempId);
-    const candidates = book.getSheets().map((sheet) => parseMatrix_(sheet.getDataRange().getDisplayValues(), file.getName(), true));
+    const candidates = book.getSheets().map((sheet) => parseMatrix_(sheet.getDataRange().getDisplayValues(), fileName, true));
     const best = candidates.sort((a, b) => b.rows.length - a.rows.length)[0];
     if (!best || !best.rows.length) throw new Error('엑셀에서 거래 표를 찾지 못했습니다.');
     return best;
@@ -501,12 +525,12 @@ function category_(description, type, direction, bucket, method) {
   }
   if (method === '상품권 충전') return '지역상품권·온누리충전';
   if (/전력|가스요금|수도|통신요금/.test(description)) return '공과금';
-  if (/PC방|피시방|노래방|영화|유람선|넥슨캐시/i.test(description)) return '문화·여가';
+  if (/PC방|피시방|[가-힣]PC(?:\s|$)|노래방|영화|유람선|넥슨캐시/i.test(description)) return '문화·여가';
   if (/의원|병원|약국/.test(description)) return '의료·건강';
   if (/헤어|미용/.test(description)) return '미용';
   if (/주유|교통|티머니|버스|택시|철도|한국자동차환경협회/.test(description)) return '교통비';
   if (/커피|카페|스타벅스|빽다방|제과|베이커리|설빙|카이막|모찌/.test(description)) return '카페·간식';
-  if (/밥상|찌개|소바|어묵|타코야끼|식당|고기|분식|치킨|피자|떡볶이|카츠호|황양반|황올/.test(description)) return '식비';
+  if (/밥상|찌개|소바|어묵|타코야끼|식당|고기|분식|치킨|피자|떡볶이|카츠호|황양반|황올|양념반|갈릭반|한마리/.test(description)) return '식비';
   if (/마트|편의점|지에스25|GS25|세븐일레븐|CU|자연드림|초코에몽|이클립스|닭가슴살|혜자|비비고김치|드럼스틱버블/.test(description)) return '식료품·편의점';
   if (/ANTHROPIC|NETFLIX|YOUTUBE|APPLE SERVICES|구독/i.test(description)) return '구독·디지털';
   if (/다이소|에프알엘코리아/.test(description)) return '쇼핑·생활';
@@ -1058,6 +1082,113 @@ function expandNativeTablesBestEffort_(ss) {
   }
 }
 
+function parseKakaoPayReceiptText_(text, sourceUrl) {
+  const blocks = String(text || '').split(/(?=\(주\)카카오페이\s+거래확인증)/).filter((part) => /거래일시/.test(part));
+  const details = blocks.map((block) => {
+    const dateTime = block.match(/거래일시\s+(20\d{2})[.\/-](\d{2})[.\/-](\d{2})\s+(\d{2}:\d{2}:\d{2})/);
+    const amount = block.match(/총\s*결제금액\s+([\d,]+)원/);
+    const paymentId = block.match(/결제번호\s+([^\s]+)/);
+    const item = block.match(/상품명\s+(.+?)(?:가맹점\s*주문번호|승인번호|결제수단|카드사)/);
+    const merchant = block.match(/공급자\s*정보\s+가맹점명\s+(.+?)\s+대표자명/);
+    if (!dateTime || !amount || !merchant) return null;
+    return {
+      paymentId: cleanText_(paymentId && paymentId[1]).slice(0, 100),
+      date: [dateTime[1], dateTime[2], dateTime[3]].join('-'), time: dateTime[4],
+      amount: parseAmount_(amount[1]), merchant: cleanText_(merchant[1]).slice(0, 300),
+      item: cleanText_(item && item[1]).slice(0, 500), sourceUrl: cleanText_(sourceUrl).slice(0, 1000)
+    };
+  }).filter(Boolean);
+  if (!details.length) throw new Error('카카오페이 거래확인증에서 결제내역을 찾지 못했습니다.');
+  return details;
+}
+
+function importKakaoPayDetails_(ss, records, sourceUrl) {
+  requireLedgerSheets_(ss);
+  const outgoing = ss.getSheetByName(LEDGER.outgoingSheet);
+  const log = ensureKakaoSyncLog_(ss);
+  const rows = outgoing.getRange(2, 1, Math.max(outgoing.getLastRow() - 1, 1), 12).getValues();
+  const rules = readSimpleRules_(ss);
+  const claimed = new Set();
+  const known = new Set();
+  if (log.getLastRow() >= 2) {
+    log.getRange(2, 6, log.getLastRow() - 1, 1).getDisplayValues().flat().forEach((id) => {
+      if (cleanText_(id)) known.add(cleanText_(id));
+    });
+  }
+  rows.forEach((row) => {
+    const ids = cleanText_(row[11]).match(/카카오페이 결제번호:\s*([^\s|\/\]]+)/g) || [];
+    ids.forEach((value) => known.add(value.replace(/^카카오페이 결제번호:\s*/, '')));
+  });
+  let matched = 0;
+  let unmatched = 0;
+  let duplicate = 0;
+  const logRows = [];
+  (records || []).forEach((detail) => {
+    if (detail.paymentId && known.has(detail.paymentId)) { duplicate += 1; return; }
+    const candidates = [];
+    rows.forEach((row, index) => {
+      if (claimed.has(index) || cleanText_(row[7]) !== '지출') return;
+      const date = row[1] instanceof Date ? Utilities.formatDate(row[1], 'Asia/Seoul', 'yyyy-MM-dd') : normalizeDate_(row[1]);
+      if (date !== detail.date || Number(row[6]) !== Number(detail.amount)) return;
+      const distance = timeDistance_(cleanText_(row[2]), detail.time);
+      const hint = cleanText_(row[4]) === '카카오페이' || /카카오페이/.test(cleanText_(row[5]));
+      candidates.push({index: index, score: distance + (hint ? 0 : 172800)});
+    });
+    candidates.sort((a, b) => a.score - b.score);
+    if (!candidates.length || candidates[0].score >= 172800 + 300) {
+      unmatched += 1;
+      logRows.push(kakaoSyncLogRow_(detail, '은행 거래와 미일치', sourceUrl));
+      return;
+    }
+    const index = candidates[0].index;
+    claimed.add(index);
+    const row = rows[index];
+    const original = cleanText_(row[5]);
+    const merchant = detail.merchant || original;
+    const matchedRule = matchSimpleRule_(merchant, rules);
+    const suggested = matchedRule ? matchedRule.category : category_(merchant + ' ' + detail.item, '', '출금', '지출', '카카오페이');
+    row[5] = merchant;
+    if ((!cleanText_(row[8]) || cleanText_(row[8]) === '기타·확인필요') && suggested !== '기타·확인필요') row[8] = suggested;
+    row[11] = kakaoLedgerNote_(row[11], detail, original, sourceUrl);
+    outgoing.getRange(index + 2, 6).setValue(safeCellText_(row[5]));
+    outgoing.getRange(index + 2, 9).setValue(safeCellText_(row[8] || '기타·확인필요'));
+    outgoing.getRange(index + 2, 12).setValue(safeCellText_(row[11]));
+    if (detail.paymentId) known.add(detail.paymentId);
+    matched += 1;
+    logRows.push(kakaoSyncLogRow_(detail, '매칭완료', sourceUrl));
+  });
+  if (logRows.length) {
+    log.getRange(log.getLastRow() + 1, 1, logRows.length, 8).setValues(logRows);
+    log.getRange(log.getLastRow() - logRows.length + 1, 1, logRows.length, 2).setNumberFormat('yyyy-mm-dd hh:mm:ss');
+    log.getRange(log.getLastRow() - logRows.length + 1, 3, logRows.length, 1).setNumberFormat('#,##0원');
+  }
+  ensureDashboard_(ss);
+  return {received: records.length, matched: matched, unmatched: unmatched, duplicate: duplicate};
+}
+
+function kakaoLedgerNote_(previous, detail, original, sourceUrl) {
+  if (detail.paymentId && cleanText_(previous).indexOf('카카오페이 결제번호: ' + detail.paymentId) >= 0) return cleanText_(previous);
+  const parts = [detail.merchant, detail.paymentId ? '카카오페이 결제번호: ' + detail.paymentId : '', detail.item ? '상품: ' + detail.item : '',
+    '표시금액: ' + Number(detail.amount).toLocaleString('ko-KR') + '원', original && original !== detail.merchant ? '은행 표시내용: ' + original : '', sourceUrl || detail.sourceUrl];
+  return cleanText_([previous, '[카카오페이 결제: ' + parts.filter(Boolean).join(' / ') + ']'].filter(Boolean).join(' ')).slice(0, 5000);
+}
+
+function ensureKakaoSyncLog_(ss) {
+  let sheet = ss.getSheetByName(LEDGER.kakaoSyncLogSheet);
+  if (!sheet) {
+    sheet = ss.insertSheet(LEDGER.kakaoSyncLogSheet);
+    sheet.getRange(1, 1, 1, 8).setValues([['처리시각', '결제일시', '금액', '사용처', '상품', '결제번호', '상태', '원본링크']]).setBackground('#eeeeee').setFontWeight('bold');
+    sheet.setFrozenRows(1);
+    sheet.hideSheet();
+  }
+  return sheet;
+}
+
+function kakaoSyncLogRow_(detail, status, sourceUrl) {
+  return [new Date(), new Date(detail.date + 'T' + detail.time + '+09:00'), detail.amount, safeCellText_(detail.merchant),
+    safeCellText_(detail.item), safeCellText_(detail.paymentId), status, sourceUrl || detail.sourceUrl || ''];
+}
+
 /**
  * New template adapter. The new household ledger intentionally keeps one
  * transaction table instead of the legacy incoming/outgoing split.
@@ -1101,7 +1232,9 @@ function commitSimpleLedgerBatch_(ss, payload) {
   setupSimpleLedger_(ss);
   PropertiesService.getUserProperties().setProperty('OWNER_LABELS', String(payload.ownerLabels || ''));
   const files = payload.files.map(validateAnalyzedFile_);
-  const all = files.flatMap((file) => file.transactions.map((tx) => validateTransaction_(tx, file.fileId)));
+  const detailFiles = files.filter((file) => file.detailType === 'kakaopay');
+  const transactionFiles = files.filter((file) => !file.detailType);
+  const all = transactionFiles.flatMap((file) => file.transactions.map((tx) => validateTransaction_(tx, file.fileId)));
   if (all.length > 10000) throw new Error('한 번에 반영할 수 있는 거래는 10,000건 이하입니다.');
 
   const inMonth = all.filter((row) => row.date.slice(0, 7) === payload.targetMonth);
@@ -1123,7 +1256,7 @@ function commitSimpleLedgerBatch_(ss, payload) {
   const rules = readSimpleRules_(ss);
   appendSimpleLedgerRows_(ss, fresh.map((row) => simpleLedgerRow_(row, rules)));
   appendSimpleSourceRows_(ss, fresh);
-  files.forEach((file) => {
+  transactionFiles.forEach((file) => {
     const fileRows = inMonth.filter((row) => row.fileId === file.fileId);
     const added = fresh.filter((row) => row.fileId === file.fileId).length;
     appendSimpleImportLog_(ss, {
@@ -1133,6 +1266,20 @@ function commitSimpleLedgerBatch_(ss, payload) {
       message: file.warnings.join(' / ')
     });
   });
+
+  const kakaoResult = detailFiles.reduce((total, file) => {
+    const result = importKakaoPayDetails_(ss, file.details, file.fileUrl);
+    total.matched += result.matched;
+    total.unmatched += result.unmatched;
+    total.duplicate += result.duplicate;
+    appendImportLog_({
+      fileName: file.fileName, fileUrl: file.fileUrl, bank: file.bank,
+      found: result.received, added: result.matched, duplicate: result.duplicate,
+      skipped: result.unmatched, status: '대조완료',
+      message: '카카오페이 영수증 매칭 ' + result.matched + '건 / 미일치 ' + result.unmatched + '건'
+    });
+    return total;
+  }, {matched: 0, unmatched: 0, duplicate: 0});
   expandSimpleTransactionTable_(ss);
   SpreadsheetApp.flush();
   return {
@@ -1142,7 +1289,10 @@ function commitSimpleLedgerBatch_(ss, payload) {
     duplicate: duplicateCount,
     skippedMonth: all.length - inMonth.length,
     targetMonth: payload.targetMonth,
-    autoTopUpMatches: autoTopUpMatches
+    autoTopUpMatches: autoTopUpMatches,
+    detailMatched: kakaoResult.matched,
+    detailUnmatched: kakaoResult.unmatched,
+    detailDuplicate: kakaoResult.duplicate
   };
 }
 
@@ -1448,7 +1598,8 @@ function validateAnalyzedFile_(file) {
   return {
     fileId: file.fileId, fileName: driveFile.getName(), fileUrl: driveFile.getUrl(),
     bank: cleanText_(file.bank), warnings: Array.isArray(file.warnings) ? file.warnings.map(cleanText_) : [],
-    transactions: file.transactions
+    detailType: file.detailType === 'kakaopay' ? 'kakaopay' : '',
+    details: Array.isArray(file.details) ? file.details : [], transactions: file.transactions
   };
 }
 

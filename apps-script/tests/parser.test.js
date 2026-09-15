@@ -41,6 +41,17 @@ const pdf = context.parseWooriPdfText_(
 assert.equal(pdf.bank, '우리은행 N페이');
 assert.equal(pdf.rows[0].outgoing, 3320);
 
+const kakao = context.parseKakaoPayReceiptText_(
+  '(주)카카오페이 거래확인증 결제 정보 결제번호 SAMPLE-1 거래일시 2026.08.22 17:37:35 거래유형 승인 상품명 베스트 Pick 뼈 한마리 가맹점 주문번호 ORDER-1 결제수단 페이머니 금액 총 결제금액 17,400원 공급자 정보 가맹점명 예시배달상점 대표자명 예시',
+  'https://example.invalid/receipt'
+);
+assert.equal(kakao.length, 1);
+assert.equal(kakao[0].date, '2026-08-22');
+assert.equal(kakao[0].amount, 17400);
+assert.equal(kakao[0].merchant, '예시배달상점');
+assert.equal(context.category_(kakao[0].merchant + ' ' + kakao[0].item, '', '출금', '지출', '카카오페이'), '식비');
+assert.equal(context.category_('예시PC 오프라인결제', '', '출금', '지출', '카카오페이'), '문화·여가');
+
 const fakeFile = {getId: () => 'file', getName: () => 'sample.xlsx', getUrl: () => 'https://example.invalid'};
 const own = context.normalizeTransaction_(ok.rows[0], ok.bank, fakeFile, ['본인이름']);
 assert.equal(own.bucket, '내부이체');
