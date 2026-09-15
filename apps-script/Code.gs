@@ -167,7 +167,7 @@ function getUploaderConfig() {
   return {
     spreadsheetName: ss.getName(),
     targetMonth: selectedMonth_(ss),
-    ownerLabels: savedNames,
+    ownerLabels: hasUsableOwnerLabel_(savedNames) ? savedNames : '',
     extensions: LEDGER.extensions,
     maxFileBytes: LEDGER.maxFileBytes,
     maxBatchBytes: LEDGER.maxBatchBytes
@@ -181,7 +181,7 @@ function getUploaderConfig() {
 function analyzeUploadedFile(payload) {
   validateUploadPayload_(payload);
   const ownerLabels = parseOwnerLabels_(payload.ownerLabels);
-  if (!ownerLabels.length) throw new Error('본인 계좌이체를 구분할 이름을 한 개 이상 입력하세요.');
+  validateOwnerLabels_(ownerLabels);
 
   const bytes = Utilities.base64Decode(payload.base64);
   if (bytes.length > LEDGER.maxFileBytes) {
@@ -254,6 +254,7 @@ function commitImportBatch(payload) {
   if (isSimpleLedger_(ss)) return commitSimpleLedgerBatch_(ss, payload);
   requireLedgerSheets_(ss);
   ensureLogSheet_(ss);
+  validateOwnerLabels_(parseOwnerLabels_(payload.ownerLabels));
   PropertiesService.getUserProperties().setProperty('OWNER_LABELS', String(payload.ownerLabels || ''));
 
   const files = payload.files.map(validateAnalyzedFile_);
@@ -556,12 +557,31 @@ function appendLedgerRows_(sheet, rows, outgoing) {
   sheet.getRange(start, 11, values.length, 1).setFormulas(rows.map((_, i) => [
     '=IF(OR(I' + (start + i) + '="기타·확인필요",I' + (start + i) + '="입금·확인필요"),"확인필요","분류완료")'
   ]));
-  const list = outgoing ? LEDGER.expenseCategories : LEDGER.incomeCategories;
-  const validation = SpreadsheetApp.newDataValidation().requireValueInList(list, true).setAllowInvalid(false).build();
-  sheet.getRange(start, 9, values.length, 1).setDataValidation(validation);
-  sheet.getRange(start, 2, values.length, 1).setNumberFormat('yyyy-mm-dd');
-  sheet.getRange(start, 7, values.length, 1).setNumberFormat('#,##0');
-  sheet.getRange(start, 10, values.length, 1).setNumberFormat('#,##0');
+  // Native Sheets tables own their column types and reject Range-level
+  // validation/format mutations with "typed column" errors. Values and
+  // formulas are enough; the table propagates its configured column types.
+  if (!sheetHasNativeTable_(sheet)) {
+    const list = outgoing ? LEDGER.expenseCategories : LEDGER.incomeCategories;
+    const validation = SpreadsheetApp.newDataValidation().requireValueInList(list, true).setAllowInvalid(false).build();
+    sheet.getRange(start, 9, values.length, 1).setDataValidation(validation);
+    sheet.getRange(start, 2, values.length, 1).setNumberFormat('yyyy-mm-dd');
+    sheet.getRange(start, 7, values.length, 1).setNumberFormat('#,##0');
+    sheet.getRange(start, 10, values.length, 1).setNumberFormat('#,##0');
+  }
+}
+
+function sheetHasNativeTable_(sheet) {
+  try {
+    const meta = Sheets.Spreadsheets.get(sheet.getParent().getId(), {
+      fields: 'sheets(properties(sheetId),tables(tableId))'
+    });
+    const targetId = sheet.getSheetId();
+    const target = (meta.sheets || []).find((item) => item.properties.sheetId === targetId);
+    return Boolean(target && target.tables && target.tables.length);
+  } catch (error) {
+    console.warn('테이블 형식 확인 보류: ' + error.message);
+    return false;
+  }
 }
 
 function appendSourceRows_(sheet, rows) {
@@ -1679,6 +1699,22 @@ function parseSignedAmount_(value) {
 
 function parseOwnerLabels_(value) {
   return String(value || '').split(/[,\n]/).map(cleanText_).filter((name) => name.length >= 2).slice(0, 10);
+}
+
+function isBankOnlyOwnerLabel_(value) {
+  return /^(?:토스|토스뱅크|우리|우리은행|ok|ok저축은행|오케이|오케이저축은행)$/i.test(cleanText_(value).replace(/\s+/g, ''));
+}
+
+function hasUsableOwnerLabel_(value) {
+  const labels = parseOwnerLabels_(value);
+  return labels.length > 0 && labels.some((label) => !isBankOnlyOwnerLabel_(label));
+}
+
+function validateOwnerLabels_(labels) {
+  if (!labels.length) throw new Error('본인 계좌이체를 구분할 이름을 한 개 이상 입력하세요.');
+  if (!labels.some((label) => !isBankOnlyOwnerLabel_(label))) {
+    throw new Error('은행명이 아니라 거래내역의 보내는 분/받는 분에 표시되는 본인 이름을 입력하세요.');
+  }
 }
 
 function extension_(name) {

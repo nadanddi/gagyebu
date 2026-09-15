@@ -6,7 +6,8 @@ body{font:14px Arial,sans-serif;color:#202124;margin:0;padding:22px}h1{font-size
 </style></head><body>
 <h1>거래내역 여러 파일 업로드</h1>
 <div class="note">PDF·CSV·XLS·XLSX를 섞어 한 번에 선택할 수 있습니다. 암호가 있는 파일만 해당 파일 옆 칸에 입력하세요. 암호는 브라우저 메모리에서만 사용되며 저장·전송되지 않습니다.</div>
-<label for="ownerLabels">본인 계좌이체 식별 이름</label><input id="ownerLabels" type="text" placeholder="이름이나 표시명을 쉼표로 구분">
+<label for="ownerLabels">본인 이름·계좌 표시명 (은행명 아님)</label><input id="ownerLabels" type="text" placeholder="예: 홍길동, 토뱅 홍길동">
+<div class="note">본인 계좌 간 이체를 지출로 잡지 않기 위한 값입니다. 거래내역의 보내는 분/받는 분에 표시되는 이름을 입력하세요.</div>
 <label for="targetMonth">반영할 월</label><input id="targetMonth" type="month">
 <label for="files">거래내역 파일</label><input id="files" type="file" multiple accept=".csv,.xls,.xlsx,.pdf,text/csv,application/pdf,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet">
 <div id="fileList"></div><div id="actions"><button id="analyze" class="primary" onclick="analyzeAll()">전체 파일 분석</button><button id="commit" class="primary" onclick="commitAll()" disabled>가계부에 반영</button><button class="secondary" onclick="google.script.host.close()">닫기</button></div><div id="status"></div><div id="results"></div>
