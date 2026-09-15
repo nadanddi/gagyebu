@@ -49,6 +49,7 @@ function onEdit(event) {
     handleSimpleLedgerEdit_(event);
     return;
   }
+  handleLegacyLedgerEdit_(event);
   if (sheet.getName() === LEDGER.dashboardSheet && event.range.getA1Notation() === 'B2') {
     ensureDashboard_(ss, cleanText_(event.value));
     return;
@@ -80,6 +81,7 @@ function setupLedgerUploader_() {
     return;
   }
   requireLedgerSheets_(ss);
+  ensureSimpleRuleSheet_(ss);
   ensureLogSheet_(ss);
   ensureMonthRegistry_(ss);
   ensureDashboard_(ss);
@@ -259,6 +261,8 @@ function commitImportBatch(payload) {
       fresh.push(row);
     }
   });
+
+  applyLegacyRulesToTransactions_(ss, fresh);
 
   const outgoing = fresh.filter((row) => row.direction === '출금');
   const incoming = fresh.filter((row) => row.direction === '입금');
@@ -807,6 +811,7 @@ function importNaverPayDetails_(ss, records) {
   if (!rowCount) return {received: records.length, matched: 0, unmatched: records.length, duplicate: 0};
 
   const outgoingRows = outgoing.getRange(2, 1, outgoing.getLastRow() - 1, 12).getValues();
+  const merchantRules = readSimpleRules_(ss);
   const claimed = new Set();
   const knownPaymentIds = new Set();
   const knownDetailKeys = new Set();
@@ -866,7 +871,8 @@ function importNaverPayDetails_(ss, records) {
     const row = outgoingRows[index];
     const merchant = detail.merchant || detail.item || cleanText_(row[5]) || '사용처 확인필요';
     const description = cleanText_([detail.merchant, detail.item].filter(Boolean).join(' '));
-    const suggested = category_(description, '', '출금', '지출', '네이버페이');
+    const matchedRule = matchSimpleRule_(merchant, merchantRules);
+    const suggested = matchedRule ? matchedRule.category : category_(description, '', '출금', '지출', '네이버페이');
     const originalDescription = cleanText_(row[5]);
     row[5] = merchant;
     if ((!cleanText_(row[8]) || cleanText_(row[8]) === '기타·확인필요') && suggested !== '기타·확인필요') row[8] = suggested;
@@ -1292,10 +1298,11 @@ function expandSimpleTransactionTable_(ss) {
 }
 
 function merchantKey_(value) {
-  return cleanText_(value).toUpperCase()
+  const normalized = cleanText_(value).toUpperCase()
     .replace(/\(주\)|㈜|주식회사|\[주\]/g, '')
     .replace(/지에스\s*25/g, 'GS25')
     .replace(/[^0-9A-Z가-힣]/g, '');
+  return normalized.indexOf('GS25') >= 0 ? 'GS25' : normalized;
 }
 
 function readSimpleRules_(ss) {
@@ -1319,10 +1326,25 @@ function handleSimpleLedgerEdit_(event) {
   applyMerchantRuleForRow_(event.source, range.getRow(), category, false);
 }
 
+function handleLegacyLedgerEdit_(event) {
+  const range = event.range;
+  if (range.getSheet().getName() !== LEDGER.outgoingSheet || range.getRow() < 2 || range.getColumn() !== 9 || range.getNumRows() !== 1 || range.getNumColumns() !== 1) return;
+  const category = cleanText_(event.value);
+  if (!category || category === '기타·확인필요' || category === '내부이체') return;
+  applyLegacyMerchantRuleForRow_(event.source, range.getRow(), category, false);
+}
+
 function applySelectedMerchantRule() {
   const ss = SpreadsheetApp.getActive();
-  if (!isSimpleLedger_(ss)) throw new Error('이 기능은 새 가계부의 거래내역 탭에서 사용합니다.');
   const range = ss.getActiveRange();
+  if (!isSimpleLedger_(ss)) {
+    if (!range || range.getSheet().getName() !== LEDGER.outgoingSheet || range.getRow() < 2) throw new Error('출금관리에서 분류할 거래 행을 선택하세요.');
+    const category = cleanText_(range.getSheet().getRange(range.getRow(), 9).getDisplayValue());
+    if (!category || category === '기타·확인필요' || category === '내부이체') throw new Error('먼저 선택한 행의 지출분류를 확정하세요.');
+    const result = applyLegacyMerchantRuleForRow_(ss, range.getRow(), category, true);
+    SpreadsheetApp.getUi().alert('“' + result.merchant + '” 규칙을 저장하고 ' + result.count + '건에 적용했습니다.');
+    return;
+  }
   if (!range || range.getSheet().getName() !== '거래내역' || range.getRow() < 6) throw new Error('거래내역에서 분류할 거래 행을 선택하세요.');
   const category = cleanText_(range.getSheet().getRange(range.getRow(), 3).getDisplayValue());
   if (!category || category === '이체') throw new Error('먼저 선택한 행의 대분류를 확정하세요.');
@@ -1360,9 +1382,52 @@ function applyMerchantRuleForRow_(ss, rowNumber, category, notify) {
   return {merchant: merchant, count: count};
 }
 
+function applyLegacyMerchantRuleForRow_(ss, rowNumber, category, notify) {
+  const sheet = ss.getSheetByName(LEDGER.outgoingSheet);
+  const row = sheet.getRange(rowNumber, 1, 1, 12).getDisplayValues()[0];
+  if (cleanText_(row[7]) !== '지출') throw new Error('지출 거래만 상호 규칙으로 분류할 수 있습니다.');
+  const merchant = cleanText_(row[5]);
+  const key = merchantKey_(merchant);
+  if (!key) throw new Error('선택한 거래에 사용처·적요가 없습니다.');
+
+  const rules = ensureSimpleRuleSheet_(ss);
+  const ruleValues = rules.getLastRow() >= 2 ? rules.getRange(2, 1, rules.getLastRow() - 1, 6).getValues() : [];
+  const existing = ruleValues.findIndex((value) => cleanText_(value[0]) === key);
+  const now = new Date();
+  const ruleRow = existing >= 0 ? existing + 2 : rules.getLastRow() + 1;
+  if (existing >= 0) rules.getRange(ruleRow, 1, 1, 6).setValues([[key, merchant, category, Number(ruleValues[existing][3]) || 0, now, '출금관리에서 확정']]);
+  else rules.appendRow([key, merchant, category, 0, now, '출금관리에서 확정']);
+
+  const length = Math.max(sheet.getLastRow() - 1, 1);
+  const values = sheet.getRange(2, 1, length, 12).getValues();
+  let count = 0;
+  values.forEach((value) => {
+    if (cleanText_(value[7]) !== '지출' || !matchSimpleRule_(cleanText_(value[5]), [{key: key}])) return;
+    if (cleanText_(value[8]) !== category) count += 1;
+    value[8] = category;
+  });
+  sheet.getRange(2, 9, length, 1).setValues(values.map((value) => [value[8]]));
+  rules.getRange(ruleRow, 4).setValue(count);
+  rules.getRange(ruleRow, 5).setValue(now).setNumberFormat('yyyy-mm-dd hh:mm');
+  if (notify) ss.toast('같은·유사 상호 ' + count + '건을 ' + category + '로 분류했습니다.', '가계부');
+  return {merchant: merchant, count: count};
+}
+
+function applyLegacyRulesToTransactions_(ss, transactions) {
+  const rules = readSimpleRules_(ss);
+  if (!rules.length) return;
+  (transactions || []).forEach((row) => {
+    if (row.direction !== '출금' || row.bucket !== '지출') return;
+    const matched = matchSimpleRule_(row.description, rules);
+    if (!matched) return;
+    row.category = matched.category;
+    row.note = cleanText_([row.note, '분류규칙: ' + matched.example].filter(Boolean).join(' / '));
+  });
+}
+
 function showCategoryRules() {
   const ss = SpreadsheetApp.getActive();
-  if (isSimpleLedger_(ss)) ss.setActiveSheet(ensureSimpleRuleSheet_(ss));
+  ss.setActiveSheet(ensureSimpleRuleSheet_(ss));
 }
 
 function requireLedgerSheets_(ss) {
